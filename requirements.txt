@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pycryptodome==3.20.0
+requests==2.32.3
+protobuf-decoder==0.0.6
+urllib3==2.2.3
+pydantic==2.9.2
