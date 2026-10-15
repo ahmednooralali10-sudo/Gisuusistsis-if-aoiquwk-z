@@ -3,7 +3,7 @@
     {
       "src": "main.py",
       "use": "@vercel/python",
-      "config": { "runtime": "python3.12", "maxLambdaSize": "50mb" }
+      "config": { "runtime": "python3.11", "maxLambdaSize": "50mb" }
     }
   ],
   "routes": [
