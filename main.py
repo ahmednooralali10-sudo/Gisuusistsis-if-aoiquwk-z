@@ -1,3 +1,10 @@
+"""
+FF Ghost Bot API
+================
+GET  /login                → login all accounts only
+GET  /start?team=<code>    → run full JOIN→INV→GHOST→EXIT sequence
+"""
+
 import os
 import sys
 import json
@@ -9,7 +16,7 @@ import urllib3
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
-from protobuf_decoder.protobuf_decoder import Parser
+import blackboxprotobuf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from concurrent.futures import ThreadPoolExecutor
@@ -194,26 +201,15 @@ def GeneRaTePk(Pk, N, K, V):
     return bytes.fromhex(HeadEr + _ + PkEnc)
 
 
-def Fix_PackEt(parsed_results):
-    result_dict = {}
-    for result in parsed_results:
-        field_data = {'wire_type': result.wire_type}
-        if result.wire_type == "varint":
-            field_data['data'] = result.data
-        if result.wire_type == "string":
-            field_data['data'] = result.data
-        if result.wire_type == "bytes":
-            field_data['data'] = result.data
-        elif result.wire_type == 'length_delimited':
-            field_data["data"] = Fix_PackEt(result.data.results)
-        result_dict[result.field] = field_data
-    return result_dict
-
-
 def DeCode_PackEt(input_text):
+    """Decode a protobuf hex string into JSON using blackboxprotobuf."""
     try:
-        parsed_results = Parser().parse(input_text)
-        return json.dumps(Fix_PackEt(parsed_results))
+        if isinstance(input_text, str):
+            data = bytes.fromhex(input_text)
+        else:
+            data = input_text
+        message, _ = blackboxprotobuf.protobuf_to_json(data)
+        return message
     except Exception:
         return None
 
