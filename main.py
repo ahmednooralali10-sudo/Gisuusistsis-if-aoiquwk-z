@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XORE FF BOT — v3.2 (4-HB parallel per account, single-file)
-============================================================
-Public landing + Admin dashboard (key-protected) with AJAX.
+XORE FF BOT — v3.4 (FULL)
+==========================
+4HB parallel + Auto-Welcome + Join/Exit Spam Toggle.
 
 Routes:
-    GET  /                       → landing (AJAX)
+    GET  /                       → landing
     GET  /?key=<ADMIN_KEY>       → dashboard
-    POST /check?key=<KEY>        → فحص حي (admin)
-    GET  /start?team=<code>      → تشغيل (JSON دائماً)
-    POST /replace                → إدارة حسابات (admin)
-    GET  /api/status             → حالة
-    GET  /health                 → فحص الصحة
-
-Speed profile (v3.2):
-    MAX_SESSION_SECONDS = 22   (كان 50)
-    LOGIN_TIMEOUT       = 8    (كان 15)
-    TCP_CONNECT_TIMEOUT = 6    (كان 15)
-    POST_LOGIN_WAIT     = 0.15 (كان 0.3)
-    read loop           = 5s   (كان 15s)
-    HB per account      = 4    (كان 2)
-    ThreadPool          = 32   (كان 15)
-    TCP_NODELAY + SO_LINGER RST + 256KB buffer
+    POST /check?key=<KEY>        → فحص حي
+    GET  /start?team=<code>      → 4HB run (JSON)
+    GET  /watch?team=<code>      → keepalive + welcome
+    GET  /spam?team=<code>&...   → join/exit spam
+    GET  /stop-watch             → إيقاف watch
+    GET  /stop-spam              → إيقاف spam
+    GET  /watch-status           → حالة
+    GET  /spam-status            → حالة
+    POST /replace                → إدارة حسابات
+    GET  /api/status /health     → حالة
 """
 import json
 import os
@@ -65,17 +60,22 @@ TCP_CONNECT_TIMEOUT = int(os.environ.get("TCP_CONNECT_TIMEOUT", "6"))
 POST_LOGIN_WAIT     = float(os.environ.get("POST_LOGIN_WAIT", "0.15"))
 LOGIN_POOL          = int(os.environ.get("LOGIN_POOL", "32"))
 
+WELCOME_MSG          = os.environ.get("WELCOME_MSG", "اهلا من مهدي")
+WELCOME_ENABLED      = os.environ.get("WELCOME_ENABLED", "1") == "1"
+WATCH_KEEPALIVE      = int(os.environ.get("WATCH_KEEPALIVE", "600"))
+WATCH_KEEPALIVE_PING = int(os.environ.get("WATCH_KEEPALIVE_PING", "18"))
+WATCH_BASELINE_WAIT  = float(os.environ.get("WATCH_BASELINE_WAIT", "3.0"))
+
+SPAM_RATE            = float(os.environ.get("SPAM_RATE", "0.15"))   # تأخير بين JOIN/EXIT
+SPAM_DURATION        = int(os.environ.get("SPAM_DURATION", "120"))  # ثانية
+SPAM_ACCOUNTS_MAX    = int(os.environ.get("SPAM_ACCOUNTS_MAX", "20"))  # سقف الحسابات المُستخدمة
+
 _DEFAULT_ACCOUNTS_RAW = os.environ.get("FF_ACCOUNTS_RAW", "") or """
 S7L8QUXNKDY8-S1X_TEAM:4555612051
 S7LFDZ8ZEEMF-S1X_TEAM:4555612941
 S7LYRBXKENCE-S1X_TEAM:4555613802
 S7LDK8QTXOX0-S1X_TEAM:4555613964
 S7LZFLTWZ3J7-S1X_TEAM:4555614387
-S7LEZNRDKML8-S1X_TEAM:4555614764
-S7LHR6RDFK17-S1X_TEAM:4555614870
-S7LXPOMEKAEI-S1X_TEAM:4555614971
-S7LJ2WHEYG3P-S1X_TEAM:4555615013
-S7LUP4A85QZR-S1X_TEAM:4555625755
 """
 
 
@@ -103,6 +103,55 @@ _LIVE_STATUS = {
     "started_at": 0, "finished_at": 0,
 }
 _LIVE_LOCK = threading.Lock()
+
+_WATCH_STATE = {
+    "active": False, "team": None, "started_at": 0,
+    "sessions": 0, "welcomed": 0, "events": [],
+}
+_WATCH_LOCK = threading.Lock()
+_WATCH_STOP_EVENTS = []
+
+_SPAM_STATE = {
+    "active": False, "team": None, "started_at": 0,
+    "accounts": 0, "cycles": 0, "joins": 0, "exits": 0, "errors": 0,
+    "events": [],
+}
+_SPAM_LOCK = threading.Lock()
+_SPAM_STOP_EVENTS = []
+
+
+def _watch_snapshot():
+    with _WATCH_LOCK:
+        return dict(_WATCH_STATE)
+
+
+def _watch_push_event(kind, uid=None):
+    with _WATCH_LOCK:
+        _WATCH_STATE["events"].insert(0, {
+            "t": time.strftime("%H:%M:%S"),
+            "kind": kind, "uid": uid,
+        })
+        del _WATCH_STATE["events"][50:]
+        if kind == "welcome":
+            _WATCH_STATE["welcomed"] += 1
+
+
+def _spam_snapshot():
+    with _SPAM_LOCK:
+        return dict(_SPAM_STATE)
+
+
+def _spam_push(kind, uid=None):
+    with _SPAM_LOCK:
+        if kind == "join":   _SPAM_STATE["joins"] += 1
+        elif kind == "exit": _SPAM_STATE["exits"] += 1
+        elif kind == "cycle":_SPAM_STATE["cycles"] += 1
+        elif kind == "error":_SPAM_STATE["errors"] += 1
+        _SPAM_STATE["events"].insert(0, {
+            "t": time.strftime("%H:%M:%S"),
+            "kind": kind, "uid": uid,
+        })
+        del _SPAM_STATE["events"][50:]
 
 
 def get_accounts():
@@ -206,6 +255,27 @@ def Parse_ProToBuF(data):
             break
         fields.setdefault(fn, []).append(val)
     return fields
+
+
+def _extract_member_uids(packet):
+    uids = set()
+    if not isinstance(packet, dict):
+        return uids
+
+    def walk(node, depth=0):
+        if depth > 8 or not isinstance(node, dict):
+            return
+        for k, v in node.items():
+            if isinstance(v, dict) and "data" in v:
+                d = v["data"]
+                if isinstance(d, int) and 100_000 < d < 99_999_999_999:
+                    uids.add(d)
+                walk(d, depth + 1)
+            elif isinstance(v, list):
+                for item in v:
+                    walk(item, depth + 1)
+    walk(packet)
+    return uids
 
 
 def Ua():
@@ -335,6 +405,19 @@ def Send_GhosTs(uid, name, sq, key, iv, lang="en"):
             2: {1: int(uid), 2: 1159, 3: name, 5: 12, 6: 9999,
                 7: 1, 8: {2: 1, 3: 1}, 9: 3, 10: lang},
             3: sq,
+        },
+    }
+    return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
+
+
+def Send_TeamChat(bot_uid, msg, squad_code, key, iv, lang="ar"):
+    text = str(msg)[:120]
+    fields = {
+        1: 61, 2: {
+            1: int(bot_uid),
+            2: {1: int(bot_uid), 2: 1159, 3: text, 5: 12, 6: 9999,
+                7: 1, 8: {2: 1, 3: 1}, 9: 3, 10: lang},
+            3: squad_code,
         },
     }
     return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
@@ -551,7 +634,7 @@ def login_account(acc_uid, acc_pass):
 
 
 # ═══════════════════════════════════════════════════════════
-#  🌐  TCP SESSION (v3.2 speed-tuned)
+#  🌐  TCP SESSION (v3.4)
 # ═══════════════════════════════════════════════════════════
 
 def BuildAuthToken(uid, jwt_str, ts, key, iv, mode="online"):
@@ -590,10 +673,10 @@ def _TuneSock(s):
 
 
 def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
-             team_code, barrier, deadline):
+             team_code, barrier, deadline, watch_state=None):
     s = None
     result = {"tag": tag, "uid": uid, "status": "started",
-              "sent": 0, "error": None}
+              "sent": 0, "error": None, "welcomed": 0}
     try:
         s = socket.create_connection((host, int(port)),
                                      timeout=TCP_CONNECT_TIMEOUT)
@@ -692,6 +775,78 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                 break
             time.sleep(0.005)
 
+        # ── WATCH MODE ──
+        if watch_state is not None and WELCOME_ENABLED:
+            result["status"] = "watching"
+            watch_deadline = time.time() + WATCH_KEEPALIVE
+            last_ping = time.time()
+            s.settimeout(1.0)
+
+            while (time.time() < watch_deadline
+                   and not watch_state["stop"].is_set()):
+                try:
+                    data = s.recv(65536)
+                    if not data:
+                        break
+                    hx = data.hex()
+                    if not hx.startswith("0500") or len(hx) < 20:
+                        continue
+                    try:
+                        js = DeCode_PackEt(hx[10:])
+                        if not js: continue
+                        packet = json.loads(js)
+                    except Exception:
+                        continue
+
+                    members = _extract_member_uids(packet)
+                    if not members: continue
+
+                    if (not watch_state["baseline_done"]
+                            and time.time() - watch_state["started"] 
+                                < WATCH_BASELINE_WAIT):
+                        with watch_state["lock"]:
+                            watch_state["known"].update(members)
+                        continue
+
+                    if not watch_state["baseline_done"]:
+                        with watch_state["lock"]:
+                            watch_state["baseline_done"] = True
+                            watch_state["known"].update(members)
+
+                    for nu in members:
+                        if nu == int(uid): continue
+                        is_new = False
+                        with watch_state["lock"]:
+                            if nu not in watch_state["known"]:
+                                watch_state["known"].add(nu)
+                                is_new = True
+                        if is_new:
+                            try:
+                                s.sendall(Send_TeamChat(
+                                    uid, WELCOME_MSG, squad_code, key, iv))
+                                result["welcomed"] += 1
+                                _watch_push_event("welcome", uid=nu)
+                            except Exception:
+                                pass
+
+                except socket.timeout:
+                    if time.time() - last_ping > WATCH_KEEPALIVE_PING:
+                        try:
+                            s.sendall(join_pkt)
+                            last_ping = time.time()
+                        except Exception:
+                            break
+                    continue
+                except Exception:
+                    break
+
+            try:
+                s.sendall(ExiT(key, iv)); result["sent"] += 1
+            except Exception:
+                pass
+            return result
+
+        # ── العادي: EXIT ──
         try:
             barrier.wait(timeout=max(0.5, deadline - time.time()))
         except Exception:
@@ -714,7 +869,8 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
             pass
 
 
-def run_one_account(session_data, team_code, barrier, deadline):
+def run_one_account(session_data, team_code, barrier, deadline,
+                    watch_state=None):
     uid = session_data["uid"]
     jwt = session_data["jwt"]; ts = session_data["ts"]
     key = session_data["key"]; iv = session_data["iv"]
@@ -728,169 +884,243 @@ def run_one_account(session_data, team_code, barrier, deadline):
 
     results = []; threads = []
     for host, port, mode, tag in plans:
-        t = threading.Thread(
-            target=lambda h=host, p=port, m=mode, tg=tag: results.append(
-                _Session(h, p, uid, jwt, ts, key, iv, m, tg,
-                         team_code, barrier, deadline)),
-            daemon=True)
+        if watch_state is not None and tag != "ChaT":
+            continue
+
+        if watch_state is not None:
+            t = threading.Thread(
+                target=lambda h=host, p=port, m=mode, tg=tag: results.append(
+                    _Session(h, p, uid, jwt, ts, key, iv, m, tg,
+                             team_code, barrier, deadline, watch_state)),
+                daemon=True)
+        else:
+            t = threading.Thread(
+                target=lambda h=host, p=port, m=mode, tg=tag: results.append(
+                    _Session(h, p, uid, jwt, ts, key, iv, m, tg,
+                             team_code, barrier, deadline)),
+                daemon=True)
         threads.append(t); t.start()
 
-    remaining = max(0.5, deadline - time.time())
-    for t in threads:
-        t.join(timeout=remaining)
+    if watch_state is not None:
+        for t in threads:
+            t.join()
+    else:
+        remaining = max(0.5, deadline - time.time())
+        for t in threads:
+            t.join(timeout=remaining)
     return results
 
 
 # ═══════════════════════════════════════════════════════════
-#  🎨  CSS
+#  💥  SPAM MODE — JOIN/EXIT rápida غير طبيعية
+# ═══════════════════════════════════════════════════════════
+
+def _SpamCycle(session_data, team_code, stop_event, rate, duration):
+    """
+    حلقة JOIN/EXIT سريعة على سوكيت واحد. تعيد استخدام auth token
+    الموجود. تكرر: JOIN × 3 → EXIT × 2 → انتظار rate → أعِد.
+    """
+    uid = session_data["uid"]
+    jwt = session_data["jwt"]; ts = session_data["ts"]
+    key = session_data["key"]; iv = session_data["iv"]
+    host = session_data["ip"]; port = session_data["port"]
+
+    s = None
+    joins = 0; exits = 0; cycles = 0
+    try:
+        s = socket.create_connection((host, int(port)),
+                                     timeout=TCP_CONNECT_TIMEOUT)
+        s.settimeout(3)
+        _TuneSock(s)
+        s.sendall(bytes.fromhex(
+            BuildAuthToken(uid, jwt, ts, key, iv, mode="online")))
+
+        join_pkt = Join_Team(team_code, key, iv)
+        exit_pkt = ExiT(key, iv)
+
+        # دخول أولي للتحضير
+        s.sendall(join_pkt)
+        joins += 1
+        _spam_push("join", uid)
+
+        end_at = time.time() + duration
+        while time.time() < end_at and not stop_event.is_set():
+            # JOIN burst
+            for _ in range(3):
+                if stop_event.is_set(): break
+                try:
+                    s.sendall(join_pkt); joins += 1
+                    _spam_push("join", uid)
+                except Exception:
+                    _spam_push("error", uid); break
+
+            time.sleep(rate)
+
+            # EXIT burst
+            for _ in range(2):
+                if stop_event.is_set(): break
+                try:
+                    s.sendall(exit_pkt); exits += 1
+                    _spam_push("exit", uid)
+                except Exception:
+                    _spam_push("error", uid); break
+
+            time.sleep(rate)
+            cycles += 1
+            _spam_push("cycle", uid)
+
+        try: s.sendall(exit_pkt)
+        except Exception: pass
+    except Exception:
+        _spam_push("error", uid)
+    finally:
+        try:
+            if s: s.close()
+        except Exception:
+            pass
+    return {"uid": uid, "joins": joins, "exits": exits, "cycles": cycles}
+
+
+# ═══════════════════════════════════════════════════════════
+#  🎨  CSS (نفس v3.3 — مختصر للاختصار)
 # ═══════════════════════════════════════════════════════════
 
 BASE_CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#06060a;--bg-2:#0d0d14;--card:#12121b;--card-2:#1a1a26;
-  --border:#25253a;--text:#eaeaf2;--muted:#6f6f88;
-  --xore-1:#8b5cf6;--xore-2:#06b6d4;--xore-3:#ec4899;
-  --success:#10f098;--warn:#f5b800;--error:#f43f5e;
-}
+:root{--bg:#06060a;--bg-2:#0d0d14;--card:#12121b;--card-2:#1a1a26;
+ --border:#25253a;--text:#eaeaf2;--muted:#6f6f88;
+ --xore-1:#8b5cf6;--xore-2:#06b6d4;--xore-3:#ec4899;
+ --success:#10f098;--warn:#f5b800;--error:#f43f5e}
 html,body{background:var(--bg);color:var(--text);
-  font-family:'Cairo','JetBrains Mono',system-ui,sans-serif;
-  min-height:100vh;line-height:1.65;-webkit-font-smoothing:antialiased}
+ font-family:'Cairo','JetBrains Mono',system-ui,sans-serif;
+ min-height:100vh;line-height:1.65}
 body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;
-  background:
-    radial-gradient(circle at 15% 5%, rgba(139,92,246,.14), transparent 45%),
-    radial-gradient(circle at 85% 95%, rgba(6,182,212,.14), transparent 45%),
-    radial-gradient(circle at 50% 50%, rgba(236,72,153,.05), transparent 60%)}
-a{color:var(--xore-2);text-decoration:none;transition:color .15s}
+ background:radial-gradient(circle at 15% 5%,rgba(139,92,246,.14),transparent 45%),
+ radial-gradient(circle at 85% 95%,rgba(6,182,212,.14),transparent 45%)}
+a{color:var(--xore-2);text-decoration:none}
 a:hover{color:var(--xore-3)}
 .container{max-width:1180px;margin:0 auto;padding:32px 20px 80px}
 .header{text-align:center;margin-bottom:40px;padding:40px 20px;position:relative}
 .header::after{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%);
-  width:80px;height:2px;
-  background:linear-gradient(90deg,transparent,var(--xore-1),var(--xore-2),transparent)}
+ width:80px;height:2px;background:linear-gradient(90deg,transparent,var(--xore-1),var(--xore-2),transparent)}
 .logo{font-size:56px;font-weight:900;letter-spacing:14px;margin-bottom:6px;
-  background:linear-gradient(135deg,var(--xore-1) 0%,var(--xore-3) 50%,var(--xore-2) 100%);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
-  filter:drop-shadow(0 0 40px rgba(139,92,246,.45))}
+ background:linear-gradient(135deg,var(--xore-1),var(--xore-3),var(--xore-2));
+ -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+ filter:drop-shadow(0 0 40px rgba(139,92,246,.45))}
 .tagline{color:var(--muted);font-size:12px;letter-spacing:6px;text-transform:uppercase;font-weight:700}
-.status-bar{display:flex;align-items:center;justify-content:center;gap:12px;
-  margin-top:22px;flex-wrap:wrap}
+.status-bar{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:22px;flex-wrap:wrap}
 .pill{display:inline-flex;align-items:center;gap:8px;padding:7px 16px;
-  border-radius:999px;background:var(--card);border:1px solid var(--border);
-  font-size:12px;font-weight:700;letter-spacing:.5px;color:var(--muted)}
+ border-radius:999px;background:var(--card);border:1px solid var(--border);
+ font-size:12px;font-weight:700;color:var(--muted)}
 .pill.live{color:var(--success);border-color:rgba(16,240,152,.3)}
 .pill.live .dot{background:var(--success);box-shadow:0 0 12px var(--success);animation:pulse 2s infinite}
 .dot{width:8px;height:8px;border-radius:50%}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .hero{display:flex;justify-content:center;margin:40px 0}
 .hero-stat{background:var(--card);border:1px solid var(--border);border-radius:24px;
-  padding:40px 60px;text-align:center;position:relative;overflow:hidden;min-width:280px}
+ padding:40px 60px;text-align:center;position:relative;overflow:hidden;min-width:280px}
 .hero-stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
-  background:linear-gradient(90deg,var(--xore-1),var(--xore-3),var(--xore-2))}
+ background:linear-gradient(90deg,var(--xore-1),var(--xore-3),var(--xore-2))}
 .hero-stat .lbl{font-size:12px;color:var(--muted);text-transform:uppercase;
-  letter-spacing:2px;font-weight:800;margin-bottom:12px}
+ letter-spacing:2px;font-weight:800;margin-bottom:12px}
 .hero-stat .val{font-size:72px;font-weight:900;line-height:1;
-  background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-  filter:drop-shadow(0 0 30px rgba(139,92,246,.5))}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
-  gap:18px;margin-bottom:32px}
+ background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
+ -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:18px;margin-bottom:32px}
 .stat{background:var(--card);border:1px solid var(--border);border-radius:18px;
-  padding:22px;position:relative;overflow:hidden;transition:transform .15s}
+ padding:22px;position:relative;overflow:hidden;transition:transform .15s}
 .stat:hover{transform:translateY(-3px)}
 .stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
-  background:linear-gradient(90deg,var(--xore-1),var(--xore-3),var(--xore-2))}
+ background:linear-gradient(90deg,var(--xore-1),var(--xore-3),var(--xore-2))}
 .stat .label{font-size:11px;color:var(--muted);text-transform:uppercase;
-  letter-spacing:1.5px;margin-bottom:10px;font-weight:800}
+ letter-spacing:1.5px;margin-bottom:10px;font-weight:800}
 .stat .value{font-size:32px;font-weight:900;line-height:1}
 .stat .value.purple{background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+ -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .stat .value.cyan{background:linear-gradient(135deg,var(--xore-2),var(--xore-1));
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+ -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .stat .value.green{color:var(--success)}
 .stat .value.red{color:var(--error)}
 .card{background:var(--card);border:1px solid var(--border);border-radius:20px;
-  padding:26px;margin-bottom:22px;position:relative}
+ padding:26px;margin-bottom:22px}
 .card h2{font-size:17px;font-weight:800;margin-bottom:20px;
-  display:flex;align-items:center;gap:12px;letter-spacing:.5px}
+ display:flex;align-items:center;gap:12px}
 .card h2::before{content:'';width:5px;height:22px;border-radius:3px;
-  background:linear-gradient(180deg,var(--xore-1),var(--xore-2))}
+ background:linear-gradient(180deg,var(--xore-1),var(--xore-2))}
 .input-row{display:flex;gap:12px;flex-wrap:wrap}
 input[type=text],textarea{flex:1;background:var(--bg-2);
-  border:1.5px solid var(--border);border-radius:12px;padding:15px 18px;
-  color:var(--text);font-family:inherit;font-size:14px;outline:none;
-  transition:border-color .15s,box-shadow .15s;min-width:200px}
+ border:1.5px solid var(--border);border-radius:12px;padding:15px 18px;
+ color:var(--text);font-family:inherit;font-size:14px;outline:none;
+ transition:border-color .15s,box-shadow .15s;min-width:200px}
 input[type=text]:focus,textarea:focus{border-color:var(--xore-1);
-  box-shadow:0 0 0 4px rgba(139,92,246,.12)}
+ box-shadow:0 0 0 4px rgba(139,92,246,.12)}
 textarea{resize:vertical;min-height:180px;font-family:'JetBrains Mono',monospace;
-  font-size:12.5px;line-height:1.7}
+ font-size:12.5px;line-height:1.7}
 button,.btn{display:inline-block;padding:15px 30px;border-radius:12px;
-  font-weight:800;font-family:inherit;font-size:14px;letter-spacing:.8px;
-  border:none;cursor:pointer;transition:all .18s;
-  background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
-  color:#fff;box-shadow:0 8px 24px -8px rgba(139,92,246,.7);text-align:center}
-button:hover,.btn:hover{transform:translateY(-2px);
-  box-shadow:0 12px 32px -8px rgba(139,92,246,.9)}
-button:active,.btn:active{transform:translateY(0)}
+ font-weight:800;font-family:inherit;font-size:14px;letter-spacing:.8px;
+ border:none;cursor:pointer;transition:all .18s;
+ background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
+ color:#fff;box-shadow:0 8px 24px -8px rgba(139,92,246,.7);text-align:center}
+button:hover,.btn:hover{transform:translateY(-2px)}
+button:disabled{opacity:.5;cursor:not-allowed;transform:none}
 button.ghost,.btn.ghost{background:transparent;color:var(--xore-2);
-  border:1.5px solid var(--xore-2);box-shadow:none}
-button.ghost:hover,.btn.ghost:hover{background:rgba(6,182,212,.08)}
+ border:1.5px solid var(--xore-2);box-shadow:none}
 button.danger{background:linear-gradient(135deg,var(--error),#b91c1c)}
 button.green{background:linear-gradient(135deg,var(--success),#059669);color:#04140c}
-button:disabled{opacity:.5;cursor:not-allowed;transform:none}
+button.warn{background:linear-gradient(135deg,var(--warn),#c2410c);color:#1a1000}
 .btn-full{width:100%;padding:18px;font-size:16px;letter-spacing:2px}
 .badge{display:inline-block;padding:5px 13px;border-radius:7px;font-size:11px;
-  font-weight:800;letter-spacing:.6px;text-transform:uppercase}
+ font-weight:800;letter-spacing:.6px;text-transform:uppercase}
 .badge.success{background:rgba(16,240,152,.14);color:var(--success);
-  border:1px solid rgba(16,240,152,.35)}
+ border:1px solid rgba(16,240,152,.35)}
 .badge.error{background:rgba(244,63,94,.14);color:var(--error);
-  border:1px solid rgba(244,63,94,.35)}
+ border:1px solid rgba(244,63,94,.35)}
 .badge.warn{background:rgba(245,184,0,.14);color:var(--warn);
-  border:1px solid rgba(245,184,0,.35)}
+ border:1px solid rgba(245,184,0,.35)}
 .badge.info{background:rgba(6,182,212,.14);color:var(--xore-2);
-  border:1px solid rgba(6,182,212,.35)}
+ border:1px solid rgba(6,182,212,.35)}
 .badge.purple{background:rgba(139,92,246,.14);color:var(--xore-1);
-  border:1px solid rgba(139,92,246,.35)}
+ border:1px solid rgba(139,92,246,.35)}
 .table{width:100%;border-collapse:collapse;font-size:13px}
 .table th,.table td{text-align:left;padding:12px 14px;border-bottom:1px solid var(--border)}
 .table th{color:var(--muted);font-weight:800;text-transform:uppercase;
-  font-size:11px;letter-spacing:1.2px;background:var(--bg-2)}
+ font-size:11px;letter-spacing:1.2px;background:var(--bg-2)}
 .table tr:hover td{background:var(--card-2)}
 .mono{font-family:'JetBrains Mono',monospace;font-size:12.5px}
 .hint{color:var(--muted);font-size:12.5px;margin-top:14px;padding:14px 18px;
-  background:var(--bg-2);border-left:3px solid var(--xore-1);border-radius:8px;line-height:1.7}
-.hint code{background:#000;padding:3px 8px;border-radius:5px;
-  color:var(--xore-2);font-size:12px;font-family:'JetBrains Mono',monospace}
+ background:var(--bg-2);border-left:3px solid var(--xore-1);border-radius:8px;line-height:1.7}
+.hint code{background:#000;padding:3px 8px;border-radius:5px;color:var(--xore-2);font-size:12px}
 .result-box{display:flex;align-items:center;gap:20px;flex-wrap:wrap;
-  padding:22px;background:var(--bg-2);border-radius:16px;margin-top:16px;
-  border:1px solid var(--border)}
+ padding:22px;background:var(--bg-2);border-radius:16px;margin-top:16px;
+ border:1px solid var(--border)}
 .result-box .big{font-size:38px;font-weight:900;line-height:1}
-.result-box .big.green{color:var(--success);text-shadow:0 0 20px rgba(16,240,152,.4)}
-.result-box .big.red{color:var(--error);text-shadow:0 0 20px rgba(244,63,94,.4)}
+.result-box .big.green{color:var(--success)}
+.result-box .big.red{color:var(--error)}
 .result-box .big.purple{background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+ -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.result-box .big.cyan{background:linear-gradient(135deg,var(--xore-2),var(--xore-1));
+ -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .result-box .label{font-size:11px;color:var(--muted);
-  text-transform:uppercase;letter-spacing:1.4px;font-weight:800;margin-bottom:6px}
+ text-transform:uppercase;letter-spacing:1.4px;font-weight:800;margin-bottom:6px}
 footer{margin-top:70px;padding-top:28px;border-top:1px solid var(--border);
-  text-align:center;color:var(--muted);font-size:12.5px}
+ text-align:center;color:var(--muted);font-size:12.5px}
 footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
-  background:linear-gradient(135deg,var(--xore-1),var(--xore-3),var(--xore-2));
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-  display:inline-block;margin-bottom:8px}
+ background:linear-gradient(135deg,var(--xore-1),var(--xore-3),var(--xore-2));
+ -webkit-background-clip:text;-webkit-text-fill-color:transparent;display:inline-block;margin-bottom:8px}
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner{display:inline-block;width:16px;height:16px;border:2px solid rgba(255,255,255,.3);
-  border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;
-  vertical-align:middle;margin-left:8px}
+ border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;
+ vertical-align:middle;margin-left:8px}
 @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
 .animate-in{animation:fadeIn .4s ease-out}
 @media (max-width:600px){
-  .container{padding:20px 14px 50px}
-  .logo{font-size:38px;letter-spacing:8px}
-  .hero-stat{padding:30px 40px}
-  .hero-stat .val{font-size:56px}
-  .stat .value{font-size:26px}
-  .card{padding:18px}
-  button,.btn{padding:13px 22px;font-size:13px}
+ .container{padding:20px 14px 50px}
+ .logo{font-size:38px;letter-spacing:8px}
+ .hero-stat{padding:30px 40px}
+ .hero-stat .val{font-size:56px}
+ .stat .value{font-size:26px}
+ .card{padding:18px}
+ button,.btn{padding:13px 22px;font-size:13px}
 }
 """
 
@@ -912,7 +1142,7 @@ def _wrap(title, body):
 {body}
 <footer>
   <div class="xore">XORE</div>
-  <div>Powered by XORE · Free Fire OB55 · ME · v3.2</div>
+  <div>Powered by XORE · Free Fire OB55 · ME · v3.4</div>
 </footer>
 </div>
 </body>
@@ -920,7 +1150,7 @@ def _wrap(title, body):
 
 
 # ═══════════════════════════════════════════════════════════
-#  📄  PUBLIC PAGE (AJAX)
+#  📄  PUBLIC PAGE (AJAX + 4HB)
 # ═══════════════════════════════════════════════════════════
 
 def render_public():
@@ -978,7 +1208,7 @@ def render_public():
 
   <div class="hint" style="text-align:center">
     اكتب كود الفريق اللي سوّيته في اللعبة، واضغط <strong>تشغيل البوت</strong>.<br>
-    كل حساب يفتح <strong>{HB_PER_ACCOUNT} اتصالات متوازية</strong> — النتيجة أسفل الصفحة بدون تغيير.
+    كل حساب يفتح <strong>{HB_PER_ACCOUNT} اتصالات متوازية</strong> — النتيجة أسفل الصفحة.
   </div>
 </div>
 
@@ -1004,30 +1234,24 @@ async function startBot(e) {{
   e.preventDefault();
   const team = document.getElementById('teamInput').value.trim();
   if (!team) return;
-
   const btn = document.getElementById('startBtn');
   const progressWrap = document.getElementById('progressWrap');
   const resultWrap = document.getElementById('resultWrap');
-
   btn.disabled = true;
   btn.innerHTML = 'يشتغل...<span class="spinner"></span>';
   resultWrap.innerHTML = '';
   progressWrap.style.display = 'block';
   document.getElementById('progressBar').style.width = '0%';
   document.getElementById('progressTime').textContent = '0s';
-
   startTime = Date.now();
   timerInterval = setInterval(updateProgress, 200);
-
   try {{
     const r = await fetch('/start?team=' + encodeURIComponent(team) + '&format=json');
     const data = await r.json();
-
     clearInterval(timerInterval);
     document.getElementById('progressBar').style.width = '100%';
     document.getElementById('progressStage').textContent = '✅ اكتمل';
     setTimeout(() => {{ progressWrap.style.display = 'none'; }}, 800);
-
     renderResult(data);
   }} catch (err) {{
     clearInterval(timerInterval);
@@ -1049,16 +1273,12 @@ function renderResult(r) {{
   const ran = r.accounts_ran || 0;
   const elapsed = r.elapsed || 0;
   const team = r.team || '?';
-
   const results = (r.results || []).slice(0, 20);
   const badgeCls = s => s === 'success' ? 'success'
     : (String(s).includes('timeout') || s === 'no_team_data' ? 'warn' : 'error');
-
   const rowsHtml = results.map(x => {{
-    const c1 = x.chat    || '-';
-    const o1 = x.online  || '-';
-    const c2 = x.chat2   || '-';
-    const o2 = x.online2 || '-';
+    const c1 = x.chat || '-'; const o1 = x.online || '-';
+    const c2 = x.chat2 || '-'; const o2 = x.online2 || '-';
     return `<tr>
       <td class="mono">${{x.uid || '?'}}</td>
       <td><span class="badge ${{badgeCls(c1)}}">${{c1}}</span></td>
@@ -1068,15 +1288,11 @@ function renderResult(r) {{
       <td class="mono">${{x.total_sent || 0}}</td>
     </tr>`;
   }}).join('') || '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:20px">لا نتائج</td></tr>';
-
   const extra = (r.results || []).length > 20
     ? `<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:12px">… و ${{r.results.length - 20}} حساب إضافي</td></tr>`
     : '';
-
-  const badge = isOk
-    ? '<span class="badge success">نجح</span>'
+  const badge = isOk ? '<span class="badge success">نجح</span>'
     : (r.status === 'failed' ? '<span class="badge error">فشل</span>' : '<span class="badge warn">غير معروف</span>');
-
   wrap.innerHTML = `
     <div class="animate-in" style="margin-top:24px">
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px;
@@ -1086,37 +1302,26 @@ function renderResult(r) {{
         <span class="badge info">${{elapsed}}s</span>
         <span class="badge info">${{r.hb_per_account || {HB_PER_ACCOUNT}}} HB/حساب</span>
       </div>
-
       <div class="stats" style="margin-bottom:20px">
-        <div class="stat">
-          <div class="label">حسابات دخلت</div>
-          <div class="value green">${{logged}}</div>
-        </div>
-        <div class="stat">
-          <div class="label">حسابات نفذت</div>
-          <div class="value purple">${{ran}}</div>
-        </div>
-        <div class="stat">
-          <div class="label">المدة</div>
-          <div class="value cyan">${{elapsed}}s</div>
-        </div>
+        <div class="stat"><div class="label">حسابات دخلت</div>
+          <div class="value green">${{logged}}</div></div>
+        <div class="stat"><div class="label">حسابات نفذت</div>
+          <div class="value purple">${{ran}}</div></div>
+        <div class="stat"><div class="label">المدة</div>
+          <div class="value cyan">${{elapsed}}s</div></div>
       </div>
-
       <h3 style="font-size:14px;font-weight:800;margin-bottom:12px;
                  letter-spacing:1px;color:var(--muted);text-transform:uppercase">
         📊 تفاصيل الحسابات
       </h3>
       <div style="overflow-x:auto;border:1px solid var(--border);border-radius:12px">
         <table class="table">
-          <thead><tr>
-            <th>UID</th><th>ChaT</th><th>OnLinE</th>
-            <th>ChaT2</th><th>OnLinE2</th><th>Sent</th>
-          </tr></thead>
+          <thead><tr><th>UID</th><th>ChaT</th><th>OnLinE</th>
+            <th>ChaT2</th><th>OnLinE2</th><th>Sent</th></tr></thead>
           <tbody>${{rowsHtml}}${{extra}}</tbody>
         </table>
       </div>
     </div>`;
-
   wrap.scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
 }}
 </script>
@@ -1125,7 +1330,7 @@ function renderResult(r) {{
 
 
 # ═══════════════════════════════════════════════════════════
-#  📄  ADMIN PAGE
+#  📄  ADMIN PAGE (watch + spam cards)
 # ═══════════════════════════════════════════════════════════
 
 def render_admin(key):
@@ -1162,7 +1367,7 @@ def render_admin(key):
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
-  <div class="tagline">ADMIN PANEL · v3.2</div>
+  <div class="tagline">ADMIN PANEL · v3.4</div>
   <div class="status-bar">
     <div class="pill live"><span class="dot"></span> ADMIN</div>
     <div class="pill">إجمالي: {count}</div>
@@ -1184,15 +1389,12 @@ def render_admin(key):
 
 <div class="card">
   <h2>🔍 فحص الحسابات الحية</h2>
-  <p style="color:var(--muted);font-size:13.5px;margin-bottom:18px">
-    اضغط الزر → يفحص كل الحسابات ويسجّل دخولها ويعرض الشغّالة والمعطّلة.
-  </p>
-  <button onclick="checkAccounts()" id="checkBtn">▶ فحص الحسابات الآن</button>
+  <button onclick="checkAccounts()" id="checkBtn">▶ فحص الآن</button>
   <div id="liveResult">{live_html}</div>
 </div>
 
 <div class="card">
-  <h2>🚀 تشغيل البوت</h2>
+  <h2>🚀 تشغيل البوت (4HB)</h2>
   <form method="get" action="/start" target="_blank">
     <input type="hidden" name="key" value="{key}">
     <div class="input-row">
@@ -1203,19 +1405,60 @@ def render_admin(key):
   </form>
 </div>
 
+<!-- ═══ WATCH MODE ═══ -->
+<div class="card">
+  <h2>👋 وضع الترحيب التلقائي</h2>
+  <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
+    البوت يبقى متصل ويترحّب بكل عضو جديد:
+    <code style="background:#000;padding:2px 8px;border-radius:4px;
+          color:var(--xore-2)">{WELCOME_MSG}</code>
+  </p>
+  <div class="input-row">
+    <input type="text" id="watchTeam" placeholder="كود الفريق..." 
+           minlength="1" maxlength="20" autocomplete="off">
+    <button onclick="startWatch()" id="watchBtn" class="green">👋 بدء الترحيب</button>
+    <button onclick="stopWatch()" class="danger">⏹ إيقاف</button>
+  </div>
+  <div id="watchStatus" style="margin-top:16px"></div>
+</div>
+
+<!-- ═══ SPAM MODE ═══ -->
+<div class="card">
+  <h2>💥 سبام دخول وخروج (Join/Exit Spam)</h2>
+  <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
+    البوت يكرر <code style="background:#000;padding:2px 8px;border-radius:4px;
+    color:var(--xore-2)">JOIN × 3 → EXIT × 2</code> بمعدل سريع جداً على غرفة الفريق.
+  </p>
+  <div class="input-row">
+    <input type="text" id="spamTeam" placeholder="كود الفريق..." 
+           minlength="1" maxlength="20" autocomplete="off">
+    <input type="text" id="spamRate" placeholder="تأخير/cycle (s)"
+           value="{SPAM_RATE}" style="max-width:140px">
+    <input type="text" id="spamDuration" placeholder="المدة (s)"
+           value="{SPAM_DURATION}" style="max-width:140px">
+    <input type="text" id="spamAccounts" placeholder="عدد الحسابات"
+           value="{min(SPAM_ACCOUNTS_MAX, 10)}" style="max-width:140px">
+  </div>
+  <div style="margin-top:14px;display:flex;gap:12px;flex-wrap:wrap">
+    <button onclick="startSpam()" id="spamBtn" class="warn">💥 بدء السبام</button>
+    <button onclick="stopSpam()" class="danger">⏹ إيقاف السبام</button>
+  </div>
+  <div id="spamStatus" style="margin-top:16px"></div>
+</div>
+
 <div class="card">
   <h2>➕ إدارة الحسابات</h2>
   <form method="post" action="/replace">
     <input type="hidden" name="key" value="{key}">
     <textarea name="raw"
-placeholder="password1:uid1&#10;password2:uid2&#10;password3:uid3&#10;... (حتى {MAX_ACCOUNTS})"></textarea>
+placeholder="password1:uid1&#10;password2:uid2&#10;... (حتى {MAX_ACCOUNTS})"></textarea>
     <div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap">
-      <button type="submit" name="mode" value="replace" class="danger">🔄 استبدال كلي</button>
-      <button type="submit" name="mode" value="append" class="green">➕ إضافة للحالي</button>
+      <button type="submit" name="mode" value="replace" class="danger">🔄 استبدال</button>
+      <button type="submit" name="mode" value="append" class="green">➕ إضافة</button>
     </div>
   </form>
   <div class="hint">
-    الصيغة: <code>password:uid</code> — كل حساب في سطر. الحد: <code>{MAX_ACCOUNTS}</code>.
+    الصيغة: <code>password:uid</code> — سطر لكل حساب.
   </div>
 </div>
 
@@ -1231,8 +1474,8 @@ placeholder="password1:uid1&#10;password2:uid2&#10;password3:uid3&#10;... (حت�
 async function checkAccounts() {{
   const btn = document.getElementById('checkBtn');
   const out = document.getElementById('liveResult');
-  btn.disabled = true; btn.textContent = '⏳ جاري الفحص...';
-  out.innerHTML = '<div class="result-box"><div class="label">⏳ يفحص، انتظر...</div></div>';
+  btn.disabled = true; btn.textContent = '⏳ ...';
+  out.innerHTML = '<div class="result-box"><div class="label">⏳ يفحص...</div></div>';
   try {{
     const r = await fetch('/check?key={key}', {{ method: 'POST' }});
     const data = await r.json();
@@ -1252,6 +1495,119 @@ async function checkAccounts() {{
     btn.disabled = false; btn.textContent = '▶ إعادة الفحص';
   }}
 }}
+
+// ─── WATCH ───
+async function refreshWatch() {{
+  try {{
+    const r = await fetch('/watch-status');
+    const d = await r.json();
+    const el = document.getElementById('watchStatus');
+    if (!d.active) {{
+      el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>';
+      return;
+    }}
+    const evs = (d.events || []).slice(0, 8).map(e =>
+      `<tr><td class="mono">${{e.t}}</td><td>${{e.kind}}</td>
+       <td class="mono">${{e.uid || '-'}}</td></tr>`).join('')
+      || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">لا أحداث</td></tr>';
+    el.innerHTML = `
+      <div class="result-box">
+        <div><div class="label">الفريق</div>
+          <div class="big purple" style="font-size:22px">${{d.team||'?'}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">جلسات</div><div class="big green">${{d.sessions}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">رحّب</div><div class="big cyan">${{d.welcomed}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">مدة</div><div class="big purple">${{d.uptime||0}}s</div></div>
+      </div>
+      <table class="table" style="margin-top:14px">
+        <thead><tr><th>الوقت</th><th>الحدث</th><th>UID</th></tr></thead>
+        <tbody>${{evs}}</tbody>
+      </table>`;
+  }} catch(e) {{}}
+}}
+
+async function startWatch() {{
+  const team = document.getElementById('watchTeam').value.trim();
+  if (!team) return;
+  const btn = document.getElementById('watchBtn');
+  btn.disabled = true; btn.textContent = '...';
+  try {{
+    const r = await fetch('/watch?team=' + encodeURIComponent(team) + '&key={key}');
+    const d = await r.json();
+    if (!d.ok) alert('خطأ: ' + (d.error || 'فشل'));
+  }} catch(e) {{ alert(e.message); }}
+  btn.disabled = false; btn.textContent = '👋 بدء الترحيب';
+  refreshWatch();
+}}
+
+async function stopWatch() {{
+  await fetch('/stop-watch?key={key}');
+  refreshWatch();
+}}
+
+// ─── SPAM ───
+async function refreshSpam() {{
+  try {{
+    const r = await fetch('/spam-status');
+    const d = await r.json();
+    const el = document.getElementById('spamStatus');
+    if (!d.active) {{
+      el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>';
+      return;
+    }}
+    const evs = (d.events || []).slice(0, 8).map(e =>
+      `<tr><td class="mono">${{e.t}}</td><td>${{e.kind}}</td>
+       <td class="mono">${{e.uid || '-'}}</td></tr>`).join('')
+      || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">لا أحداث</td></tr>';
+    el.innerHTML = `
+      <div class="result-box">
+        <div><div class="label">الفريق</div>
+          <div class="big purple" style="font-size:22px">${{d.team||'?'}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">حسابات</div><div class="big cyan">${{d.accounts}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">دورات</div><div class="big green">${{d.cycles}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">JOIN</div><div class="big green">${{d.joins}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">EXIT</div><div class="big red">${{d.exits}}</div></div>
+      </div>
+      <table class="table" style="margin-top:14px">
+        <thead><tr><th>الوقت</th><th>الحدث</th><th>UID</th></tr></thead>
+        <tbody>${{evs}}</tbody>
+      </table>`;
+  }} catch(e) {{}}
+}}
+
+async function startSpam() {{
+  const team = document.getElementById('spamTeam').value.trim();
+  const rate = document.getElementById('spamRate').value.trim() || '0.15';
+  const dur = document.getElementById('spamDuration').value.trim() || '120';
+  const accs = document.getElementById('spamAccounts').value.trim() || '10';
+  if (!team) return;
+  const btn = document.getElementById('spamBtn');
+  btn.disabled = true; btn.textContent = '...';
+  try {{
+    const url = `/spam?team=${{encodeURIComponent(team)}}&rate=${{rate}}`
+      + `&duration=${{dur}}&accounts=${{accs}}&key={key}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (!d.ok) alert('خطأ: ' + (d.error || 'فشل'));
+  }} catch(e) {{ alert(e.message); }}
+  btn.disabled = false; btn.textContent = '💥 بدء السبام';
+  refreshSpam();
+}}
+
+async function stopSpam() {{
+  await fetch('/stop-spam?key={key}');
+  refreshSpam();
+}}
+
+setInterval(refreshWatch, 3000);
+setInterval(refreshSpam, 3000);
+refreshWatch(); refreshSpam();
 </script>
 """
     return _wrap("Admin", body)
@@ -1261,7 +1617,7 @@ async function checkAccounts() {{
 #  🚀  FASTAPI APP
 # ═══════════════════════════════════════════════════════════
 
-app = FastAPI(title="XORE FF Bot", version="3.2.0")
+app = FastAPI(title="XORE FF Bot", version="3.4.0")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1273,9 +1629,18 @@ def root(key: str = Query("")):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "3.2.0",
-            "hb_per_account": HB_PER_ACCOUNT,
-            "max_session_seconds": MAX_SESSION_SECONDS}
+    ws = _watch_snapshot(); sp = _spam_snapshot()
+    return {
+        "ok": True, "version": "3.4.0",
+        "hb_per_account": HB_PER_ACCOUNT,
+        "max_session_seconds": MAX_SESSION_SECONDS,
+        "welcome_enabled": WELCOME_ENABLED,
+        "welcome_msg": WELCOME_MSG,
+        "watch_active": ws["active"], "watch_team": ws["team"],
+        "watch_sessions": ws["sessions"],
+        "spam_active": sp["active"], "spam_team": sp["team"],
+        "spam_cycles": sp["cycles"],
+    }
 
 
 @app.post("/check")
@@ -1286,7 +1651,6 @@ def check_live(key: str = Query("")):
     accounts = get_accounts()
     if not accounts:
         return {"ok": False, "error": "no accounts"}
-
     _set_live_status(checking=True, checked=False,
                      total=len(accounts), started_at=time.time())
     results = []
@@ -1301,7 +1665,6 @@ def check_live(key: str = Query("")):
             results.append({"uid": uid, "ok": r is not None,
                             "name": r["name"] if r else None,
                             "error": None if r else "login failed"})
-
     alive = sum(1 for r in results if r["ok"])
     dead = len(results) - alive
     _set_live_status(checking=False, checked=True,
@@ -1319,7 +1682,6 @@ def start_bot(
 ):
     if not team.strip():
         raise HTTPException(400, "Team code required")
-
     start_time = time.time()
     deadline = start_time + MAX_SESSION_SECONDS
     accounts = get_accounts()
@@ -1328,9 +1690,7 @@ def start_bot(
             "status": "failed", "reason": "no accounts",
             "team": team, "results": [],
         })
-
-    sessions = []
-    login_errors = []
+    sessions = []; login_errors = []
     with ThreadPoolExecutor(max_workers=min(len(accounts), LOGIN_POOL)) as pool:
         futures = {uid: pool.submit(login_account, uid, pw)
                    for uid, pw in accounts}
@@ -1344,7 +1704,6 @@ def start_bot(
                 sessions.append(r)
             else:
                 login_errors.append({"uid": uid, "error": "login failed"})
-
     if not sessions:
         return JSONResponse(status_code=502, content={
             "status": "failed", "reason": "no sessions",
@@ -1353,7 +1712,6 @@ def start_bot(
             "accounts_logged": 0, "accounts_ran": 0,
             "hb_per_account": HB_PER_ACCOUNT,
         })
-
     barrier = threading.Barrier(len(sessions) * HB_PER_ACCOUNT)
     results = []; threads = []
     for s in sessions:
@@ -1364,7 +1722,6 @@ def start_bot(
         threads.append(t); t.start()
     for t in threads:
         t.join(timeout=max(0.1, deadline - time.time()))
-
     by_account = {}
     for r in results:
         uid = str(r.get("uid"))
@@ -1379,7 +1736,6 @@ def start_bot(
         elif tag == "OnLinE2": e["online2"] = r["status"]
         e["total_sent"] += r.get("sent", 0)
         if r.get("error"): e["errors"].append(f"{tag}: {r['error']}")
-
     return {
         "status": "completed", "team": team,
         "elapsed": round(time.time() - start_time, 2),
@@ -1391,30 +1747,240 @@ def start_bot(
     }
 
 
+@app.get("/watch")
+def watch_bot(
+    team: str = Query(..., min_length=1, max_length=20),
+    key: str = Query(""),
+    duration: int = Query(0),
+):
+    if not team.strip():
+        raise HTTPException(400, "Team code required")
+    snap = _watch_snapshot()
+    if snap["active"]:
+        return JSONResponse(status_code=409, content={
+            "ok": False, "error": "watch already active",
+            "team": snap["team"], "sessions": snap["sessions"],
+        })
+    global _WATCH_STOP_EVENTS
+    stop_event = threading.Event()
+    _WATCH_STOP_EVENTS.append(stop_event)
+    accounts = get_accounts()
+    if not accounts:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": "no accounts"})
+    sessions_data = []; login_errors = []
+    with ThreadPoolExecutor(max_workers=min(len(accounts), LOGIN_POOL)) as pool:
+        futures = {uid: pool.submit(login_account, uid, pw)
+                   for uid, pw in accounts}
+        for uid, f in futures.items():
+            try:
+                r = f.result(timeout=LOGIN_TIMEOUT)
+            except Exception as e:
+                r = None
+                login_errors.append({"uid": uid, "error": str(e)})
+            if r: sessions_data.append(r)
+            else: login_errors.append({"uid": uid, "error": "login failed"})
+    if not sessions_data:
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": "no sessions",
+            "login_errors": login_errors,
+        })
+    barrier = threading.Barrier(len(sessions_data))
+
+    def _watch_worker(sd):
+        ws = {
+            "stop": stop_event,
+            "lock": threading.Lock(),
+            "known": {int(sd["uid"])},
+            "baseline_done": False,
+            "started": time.time(),
+        }
+        try:
+            run_one_account(sd, team, barrier, time.time() + 60, ws)
+        except Exception:
+            pass
+
+    for sd in sessions_data:
+        threading.Thread(target=_watch_worker, args=(sd,),
+                         daemon=True).start()
+
+    with _WATCH_LOCK:
+        _WATCH_STATE["active"] = True
+        _WATCH_STATE["team"] = team
+        _WATCH_STATE["started_at"] = time.time()
+        _WATCH_STATE["sessions"] = len(sessions_data)
+        _WATCH_STATE["welcomed"] = 0
+        _WATCH_STATE["events"] = []
+
+    if duration > 0:
+        def _auto_stop():
+            time.sleep(duration)
+            stop_event.set()
+            with _WATCH_LOCK:
+                _WATCH_STATE["active"] = False
+        threading.Thread(target=_auto_stop, daemon=True).start()
+
+    return {
+        "ok": True, "team": team,
+        "sessions": len(sessions_data),
+        "login_errors": login_errors,
+        "welcome_msg": WELCOME_MSG,
+        "keepalive_s": WATCH_KEEPALIVE,
+        "duration_s": duration or WATCH_KEEPALIVE,
+    }
+
+
+@app.get("/stop-watch")
+def stop_watch(key: str = Query("")):
+    global _WATCH_STOP_EVENTS
+    with _WATCH_LOCK:
+        n = len(_WATCH_STOP_EVENTS)
+        for ev in _WATCH_STOP_EVENTS:
+            ev.set()
+        _WATCH_STOP_EVENTS.clear()
+        _WATCH_STATE["active"] = False
+    return {"ok": True, "stopped": n}
+
+
+@app.get("/watch-status")
+def watch_status():
+    snap = _watch_snapshot()
+    if snap["active"]:
+        snap["uptime"] = round(time.time() - snap["started_at"], 1)
+    return {"ok": True, **snap, "welcome_msg": WELCOME_MSG}
+
+
+# ─── SPAM ENDPOINTS ───
+@app.get("/spam")
+def spam_bot(
+    team: str = Query(..., min_length=1, max_length=20),
+    key: str = Query(""),
+    rate: float = Query(SPAM_RATE),
+    duration: int = Query(SPAM_DURATION),
+    accounts: int = Query(10),
+):
+    """
+    يبدأ وضع السبام: JOIN/EXIT سريع جداً. يعمل على N حساب كحد أقصى.
+    """
+    if not team.strip():
+        raise HTTPException(400, "Team code required")
+    snap = _spam_snapshot()
+    if snap["active"]:
+        return JSONResponse(status_code=409, content={
+            "ok": False, "error": "spam already active",
+            "team": snap["team"],
+        })
+
+    rate = max(0.02, min(rate, 5.0))           # بين 20ms و 5s
+    duration = max(5, min(duration, 1800))     # بين 5s و 30 دقيقة
+    accounts = max(1, min(accounts, SPAM_ACCOUNTS_MAX))
+
+    all_accs = get_accounts()
+    if not all_accs:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": "no accounts"})
+    sel = all_accs[:accounts]
+
+    sessions_data = []; login_errors = []
+    with ThreadPoolExecutor(max_workers=min(len(sel), LOGIN_POOL)) as pool:
+        futures = {uid: pool.submit(login_account, uid, pw)
+                   for uid, pw in sel}
+        for uid, f in futures.items():
+            try:
+                r = f.result(timeout=LOGIN_TIMEOUT)
+            except Exception as e:
+                r = None
+                login_errors.append({"uid": uid, "error": str(e)})
+            if r: sessions_data.append(r)
+            else: login_errors.append({"uid": uid, "error": "login failed"})
+
+    if not sessions_data:
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": "no sessions",
+            "login_errors": login_errors,
+        })
+
+    global _SPAM_STOP_EVENTS
+    stop_event = threading.Event()
+    _SPAM_STOP_EVENTS.append(stop_event)
+
+    def _spam_worker(sd):
+        try:
+            _SpamCycle(sd, team, stop_event, rate, duration)
+        except Exception:
+            _spam_push("error", sd["uid"])
+
+    for sd in sessions_data:
+        threading.Thread(target=_spam_worker, args=(sd,),
+                         daemon=True).start()
+
+    with _SPAM_LOCK:
+        _SPAM_STATE["active"] = True
+        _SPAM_STATE["team"] = team
+        _SPAM_STATE["started_at"] = time.time()
+        _SPAM_STATE["accounts"] = len(sessions_data)
+        _SPAM_STATE["cycles"] = 0
+        _SPAM_STATE["joins"] = 0
+        _SPAM_STATE["exits"] = 0
+        _SPAM_STATE["errors"] = 0
+        _SPAM_STATE["events"] = []
+
+    # auto-stop بعد duration
+    def _auto_stop():
+        time.sleep(duration + 2)
+        stop_event.set()
+        with _SPAM_LOCK:
+            _SPAM_STATE["active"] = False
+    threading.Thread(target=_auto_stop, daemon=True).start()
+
+    return {
+        "ok": True, "team": team,
+        "accounts": len(sessions_data),
+        "rate_s": rate, "duration_s": duration,
+        "login_errors": login_errors,
+    }
+
+
+@app.get("/stop-spam")
+def stop_spam(key: str = Query("")):
+    global _SPAM_STOP_EVENTS
+    with _SPAM_LOCK:
+        n = len(_SPAM_STOP_EVENTS)
+        for ev in _SPAM_STOP_EVENTS:
+            ev.set()
+        _SPAM_STOP_EVENTS.clear()
+        _SPAM_STATE["active"] = False
+    return {"ok": True, "stopped": n}
+
+
+@app.get("/spam-status")
+def spam_status():
+    snap = _spam_snapshot()
+    if snap["active"]:
+        snap["uptime"] = round(time.time() - snap["started_at"], 1)
+    return {"ok": True, **snap}
+
+
 @app.post("/replace")
 async def replace_endpoint(request: Request):
     form = await request.form()
     raw = form.get("raw", "") or ""
     mode = form.get("mode", "replace")
     key = form.get("key", "") or ""
-
     if not is_admin(key):
         return HTMLResponse(_wrap("Error", """
             <div class="card"><h2 style="color:var(--error)">❌ مفتاح غير صحيح</h2>
             <a href="/" class="btn">← الرجوع</a></div>"""), status_code=403)
-
     if not raw.strip():
         return HTMLResponse(_wrap("Error", f"""
             <div class="card"><h2 style="color:var(--error)">❌ لا يوجد بيانات</h2>
             <a href="/?key={key}" class="btn">← الرجوع</a></div>"""))
-
     if mode == "append":
         added = add_accounts(raw)
         msg = f"تمت إضافة {added} حساب"
     else:
         n = replace_accounts(raw)
         msg = f"تم استبدال الحسابات — الإجمالي {n} حساب"
-
     return HTMLResponse(_wrap("Done", f"""
         <div class="header">
           <div class="logo" style="font-size:34px;letter-spacing:8px">DONE</div>
@@ -1434,16 +2000,18 @@ async def replace_endpoint(request: Request):
 
 @app.get("/api/status")
 def api_status():
-    live = get_live_status()
+    live = get_live_status(); ws = _watch_snapshot(); sp = _spam_snapshot()
     return {
-        "status": "ok",
-        "version": "3.2.0",
+        "status": "ok", "version": "3.4.0",
         "accounts": len(get_accounts()),
         "max_accounts": MAX_ACCOUNTS,
         "hb_per_account": HB_PER_ACCOUNT,
         "max_session_seconds": MAX_SESSION_SECONDS,
         "alive": live["alive"] if live["checked"] else None,
         "dead": live["dead"] if live["checked"] else None,
+        "watch_active": ws["active"],
+        "spam_active": sp["active"],
+        "spam_cycles": sp["cycles"],
         "release": "OB55", "region": "ME",
     }
 
