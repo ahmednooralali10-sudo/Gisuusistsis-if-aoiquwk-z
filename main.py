@@ -1,12 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XORE FF BOT — v4.1 (FULL SINGLE FILE)
+XORE FF BOT — v5.0 (FULL SINGLE FILE)
 ======================================
-Public  : Ghost 4HB ONLY (speed 6x)
-Admin   : Ghost + Global Blitz + Spam + Auto-Welcome + Live Check + Accounts
+Public  : Ghost 4HB (Speed 6x) — auto progress, realtime stats, no reload
+Admin   : Ghost + Blitz + Spam + Watch + Accounts CRUD (all AJAX) + Logs + Stats
+
+NEW in v5.0:
+  [Account Manager — AJAX, no page reload]
+    - Add / Replace via fetch(), result inline di bawah form
+    - Batch select (checkboxes) + bulk enable/disable/delete
+    - Sort (UID / status / alias / added_at)
+    - Pagination (25/50/100 per page)
+    - Live search dengan counter realtime
+    - Quick filter: All / Enabled / Disabled / Alive / Dead
+    - Alias + Note per akun
+    - Password reveal/hide toggle
+    - UID copy + Password copy (dua tombol)
+    - Test single akun langsung dari list
+    - Duplicate detection saat import
+    - Auto-save draft textarea ke localStorage
+  [Dashboard]
+    - Live stats polling (auto-refresh 2s, toggleable)
+    - Currently-running modules indicator (ghost/blitz/spam/watch)
+    - Session history (last 50 runs)
+    - Toast notification system (success/error/info/warn)
+    - Sound alert toggle on events
+    - Compact / Expanded view toggle
+    - Dark / Light theme toggle
+  [Export]
+    - TXT / JSON / CSV
+  [Misc]
+    - Keyboard shortcuts (Ctrl+S save, Ctrl+F search, Esc close)
+    - Webhook notification endpoint (optional)
+    - Health endpoint extended
 """
-import asyncio
+import csv
+import io
 import json
 import os
 import random
@@ -15,12 +45,13 @@ import struct
 import threading
 import time
 import urllib3
+from datetime import datetime
 
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -64,6 +95,7 @@ BLITZ_ACCOUNTS_MAX   = int(os.environ.get("BLITZ_ACCOUNTS_MAX", "100"))
 BLITZ_LINGER_S       = float(os.environ.get("BLITZ_LINGER_S", "3.0"))
 BLITZ_CHANNEL        = int(os.environ.get("BLITZ_CHANNEL", "2"))
 
+WEBHOOK_URL          = os.environ.get("WEBHOOK_URL", "")
 XORE_DEBUG           = os.environ.get("XORE_DEBUG", "0") == "1"
 
 
@@ -72,37 +104,228 @@ def _log(*a):
         print("[XORE]", *a, flush=True)
 
 
-_DEFAULT_ACCOUNTS_RAW = os.environ.get("FF_ACCOUNTS_RAW", "") or """
-S7L8QUXNKDY8-S1X_TEAM:4555612051
-S7LFDZ8ZEEMF-S1X_TEAM:4555612941
-S7LYRBXKENCE-S1X_TEAM:4555613802
-S7LDK8QTXOX0-S1X_TEAM:4555613964
-S7LZFLTWZ3J7-S1X_TEAM:4555614387
-S7LEZNRDKML8-S1X_TEAM:4555614764
-S7LHR6RDFK17-S1X_TEAM:4555614870
-S7LXPOMEKAEI-S1X_TEAM:4555614971
-S7LJ2WHEYG3P-S1X_TEAM:4555615013
-S7LUP4A85QZR-S1X_TEAM:4555625755
-"""
+# ═══════════════════════════════════════════════════════════
+#  👥  ACCOUNT STORE
+# ═══════════════════════════════════════════════════════════
+
+_DEFAULT_ACCOUNTS_RAW = os.environ.get("FF_ACCOUNTS_RAW", "") or ""
 
 
 def _parse_accounts(raw):
     if not raw or not raw.strip():
         return []
     out = []
+    seen = set()
     for chunk in raw.replace(";", "\n").replace(",", "\n").splitlines():
         chunk = chunk.strip()
         if not chunk or chunk.startswith("#") or ":" not in chunk:
             continue
         pw, uid = chunk.split(":", 1)
         pw, uid = pw.strip(), uid.strip()
-        if pw and uid:
+        if pw and uid and uid not in seen:
+            seen.add(uid)
             out.append((uid, pw))
     return out[:MAX_ACCOUNTS]
 
 
 _ACCOUNTS = _parse_accounts(_DEFAULT_ACCOUNTS_RAW)
+_DISABLED_UIDS = set()
 _ACCOUNTS_LOCK = threading.Lock()
+
+# Per-account metadata (alias, note, timestamps, last known status)
+_ACCOUNT_META = {}   # uid -> {"alias": str, "note": str, "added_at": float,
+                     #         "last_status": str, "last_check": float}
+_META_LOCK = threading.Lock()
+
+
+def _meta_get(uid):
+    with _META_LOCK:
+        m = _ACCOUNT_META.get(uid)
+        if m is None:
+            m = {"alias": "", "note": "", "added_at": time.time(),
+                 "last_status": None, "last_check": 0}
+            _ACCOUNT_META[uid] = m
+        return dict(m)
+
+
+def _meta_update(uid, **kw):
+    with _META_LOCK:
+        m = _ACCOUNT_META.setdefault(uid, {
+            "alias": "", "note": "", "added_at": time.time(),
+            "last_status": None, "last_check": 0,
+        })
+        m.update(kw)
+
+
+def _meta_set_status(uid, status):
+    with _META_LOCK:
+        m = _ACCOUNT_META.setdefault(uid, {
+            "alias": "", "note": "", "added_at": time.time(),
+            "last_status": None, "last_check": 0,
+        })
+        m["last_status"] = status
+        m["last_check"] = time.time()
+
+
+def _meta_drop(uid):
+    with _META_LOCK:
+        _ACCOUNT_META.pop(uid, None)
+
+
+def get_accounts():
+    with _ACCOUNTS_LOCK:
+        return [(u, p) for (u, p) in _ACCOUNTS if u not in _DISABLED_UIDS]
+
+
+def get_all_accounts_raw():
+    with _ACCOUNTS_LOCK:
+        return [(u, p, u not in _DISABLED_UIDS) for (u, p) in _ACCOUNTS]
+
+
+def count_accounts():
+    with _ACCOUNTS_LOCK:
+        return len(_ACCOUNTS)
+
+
+def add_accounts(raw):
+    with _ACCOUNTS_LOCK:
+        existing = {u for (u, p) in _ACCOUNTS}
+        added, skipped_dup = 0, 0
+        for u, p in _parse_accounts(raw):
+            if u in existing:
+                skipped_dup += 1
+                continue
+            if len(_ACCOUNTS) >= MAX_ACCOUNTS:
+                break
+            _ACCOUNTS.append((u, p))
+            existing.add(u)
+            added += 1
+            _meta_update(u, added_at=time.time())
+    return {"added": added, "skipped_dup": skipped_dup,
+            "total": count_accounts()}
+
+
+def replace_accounts(raw):
+    global _ACCOUNTS, _DISABLED_UIDS
+    new_list = _parse_accounts(raw)
+    with _ACCOUNTS_LOCK:
+        _ACCOUNTS = new_list[:MAX_ACCOUNTS]
+        _DISABLED_UIDS = set()
+    return len(_ACCOUNTS)
+
+
+def delete_account(uid):
+    global _ACCOUNTS, _DISABLED_UIDS
+    with _ACCOUNTS_LOCK:
+        before = len(_ACCOUNTS)
+        _ACCOUNTS = [(u, p) for (u, p) in _ACCOUNTS if u != uid]
+        _DISABLED_UIDS.discard(uid)
+        removed = before - len(_ACCOUNTS)
+    if removed:
+        _meta_drop(uid)
+    return removed
+
+
+def bulk_delete(uids):
+    if not uids:
+        return 0
+    s = set(uids)
+    global _ACCOUNTS, _DISABLED_UIDS
+    with _ACCOUNTS_LOCK:
+        before = len(_ACCOUNTS)
+        _ACCOUNTS = [(u, p) for (u, p) in _ACCOUNTS if u not in s]
+        _DISABLED_UIDS -= s
+        removed = before - len(_ACCOUNTS)
+    for u in s:
+        _meta_drop(u)
+    return removed
+
+
+def clear_accounts():
+    global _ACCOUNTS, _DISABLED_UIDS
+    with _ACCOUNTS_LOCK:
+        n = len(_ACCOUNTS)
+        _ACCOUNTS = []
+        _DISABLED_UIDS = set()
+    with _META_LOCK:
+        _ACCOUNT_META.clear()
+    return n
+
+
+def toggle_account(uid):
+    with _ACCOUNTS_LOCK:
+        if not any(u == uid for (u, p) in _ACCOUNTS):
+            return None
+        if uid in _DISABLED_UIDS:
+            _DISABLED_UIDS.discard(uid)
+            return True
+        _DISABLED_UIDS.add(uid)
+        return False
+
+
+def set_enabled_many(uids, enabled):
+    n = 0
+    with _ACCOUNTS_LOCK:
+        present = {u for (u, p) in _ACCOUNTS}
+        for u in uids:
+            if u not in present:
+                continue
+            if enabled:
+                if u in _DISABLED_UIDS:
+                    _DISABLED_UIDS.discard(u)
+                    n += 1
+            else:
+                if u not in _DISABLED_UIDS:
+                    _DISABLED_UIDS.add(u)
+                    n += 1
+    return n
+
+
+def export_accounts_text():
+    with _ACCOUNTS_LOCK:
+        return "\n".join(f"{p}:{u}" for (u, p) in _ACCOUNTS)
+
+
+def export_accounts_csv():
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["uid", "password", "alias", "enabled", "last_status",
+                "last_check", "added_at"])
+    with _ACCOUNTS_LOCK:
+        rows = list(_ACCOUNTS)
+    for u, p in rows:
+        m = _meta_get(u)
+        w.writerow([u, p, m.get("alias", ""),
+                    "1" if u not in _DISABLED_UIDS else "0",
+                    m.get("last_status") or "",
+                    datetime.fromtimestamp(m.get("last_check") or 0)
+                        .strftime("%Y-%m-%d %H:%M:%S")
+                        if m.get("last_check") else "",
+                    datetime.fromtimestamp(m.get("added_at") or 0)
+                        .strftime("%Y-%m-%d %H:%M:%S")])
+    return buf.getvalue()
+
+
+def export_accounts_json():
+    with _ACCOUNTS_LOCK:
+        rows = list(_ACCOUNTS)
+    out = []
+    for u, p in rows:
+        m = _meta_get(u)
+        out.append({
+            "uid": u, "password": p,
+            "alias": m.get("alias", ""), "note": m.get("note", ""),
+            "enabled": u not in _DISABLED_UIDS,
+            "last_status": m.get("last_status"),
+            "last_check": m.get("last_check", 0),
+            "added_at": m.get("added_at", 0),
+        })
+    return out
+
+
+# ═══════════════════════════════════════════════════════════
+#  📊  STATE
+# ═══════════════════════════════════════════════════════════
 
 _LIVE_STATUS = {
     "checked": False, "total": 0, "alive": 0, "dead": 0,
@@ -134,6 +357,67 @@ _BLITZ_STATE = {
 _BLITZ_LOCK = threading.Lock()
 _BLITZ_STOP_EVENTS = []
 
+_GHOST_STATE = {
+    "active": False, "team": None, "started_at": 0,
+    "accounts": 0, "finished_at": 0, "last_result": None,
+}
+_GHOST_LOCK = threading.Lock()
+
+_STATS = {
+    "ghost_runs": 0, "blitz_runs": 0, "spam_runs": 0, "watch_runs": 0,
+    "checks": 0, "logins_ok": 0, "logins_fail": 0,
+    "started_at": time.time(),
+}
+_STATS_LOCK = threading.Lock()
+
+_ACTIVITY_LOG = []
+_ACTIVITY_LOCK = threading.Lock()
+
+_HISTORY = []   # newest first
+_HISTORY_LOCK = threading.Lock()
+
+
+def _stats_inc(key, n=1):
+    with _STATS_LOCK:
+        _STATS[key] = _STATS.get(key, 0) + n
+
+
+def _stats_snapshot():
+    with _STATS_LOCK:
+        s = dict(_STATS)
+        s["uptime"] = int(time.time() - s.get("started_at", time.time()))
+        return s
+
+
+def _activity(kind, msg="", uid=None):
+    with _ACTIVITY_LOCK:
+        _ACTIVITY_LOG.insert(0, {
+            "t": time.strftime("%H:%M:%S"),
+            "ts": time.time(), "kind": kind, "msg": msg, "uid": uid,
+        })
+        del _ACTIVITY_LOG[300:]
+
+
+def _activity_snapshot(limit=80):
+    with _ACTIVITY_LOCK:
+        return list(_ACTIVITY_LOG[:limit])
+
+
+def _history_push(kind, team, accounts, extra=None):
+    with _HISTORY_LOCK:
+        _HISTORY.insert(0, {
+            "t": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ts": time.time(),
+            "kind": kind, "team": team, "accounts": accounts,
+            "extra": extra or {},
+        })
+        del _HISTORY[100:]
+
+
+def _history_snapshot(limit=50):
+    with _HISTORY_LOCK:
+        return list(_HISTORY[:limit])
+
 
 def _watch_snapshot():
     with _WATCH_LOCK:
@@ -148,6 +432,7 @@ def _watch_push_event(kind, uid=None):
         del _WATCH_STATE["events"][50:]
         if kind == "welcome":
             _WATCH_STATE["welcomed"] += 1
+    _activity(f"watch:{kind}", uid=uid)
 
 
 def _spam_snapshot():
@@ -165,6 +450,8 @@ def _spam_push(kind, uid=None):
             "t": time.strftime("%H:%M:%S"), "kind": kind, "uid": uid,
         })
         del _SPAM_STATE["events"][50:]
+    if kind in ("cycle", "error"):
+        _activity(f"spam:{kind}", uid=uid)
 
 
 def _blitz_snapshot():
@@ -182,29 +469,13 @@ def _blitz_push(kind, uid=None):
             "t": time.strftime("%H:%M:%S"), "kind": kind, "uid": uid,
         })
         del _BLITZ_STATE["events"][80:]
+    if kind in ("joined", "welcome", "exit", "error"):
+        _activity(f"blitz:{kind}", uid=uid)
 
 
-def get_accounts():
-    with _ACCOUNTS_LOCK:
-        return list(_ACCOUNTS)
-
-
-def add_accounts(raw):
-    with _ACCOUNTS_LOCK:
-        existing = {(u, p) for u, p in _ACCOUNTS}
-        added = 0
-        for u, p in _parse_accounts(raw):
-            if (u, p) not in existing and len(_ACCOUNTS) < MAX_ACCOUNTS:
-                _ACCOUNTS.append((u, p)); existing.add((u, p)); added += 1
-        return added
-
-
-def replace_accounts(raw):
-    global _ACCOUNTS
-    new_list = _parse_accounts(raw)
-    with _ACCOUNTS_LOCK:
-        _ACCOUNTS = new_list[:MAX_ACCOUNTS]
-    return len(_ACCOUNTS)
+def _ghost_snapshot():
+    with _GHOST_LOCK:
+        return dict(_GHOST_STATE)
 
 
 def get_live_status():
@@ -443,12 +714,7 @@ def Send_GhosTs(uid, name, sq, key, iv, lang="en"):
 def Send_TeamChat(bot_uid, msg, squad_code, key, iv, channel=1):
     text = str(msg)[:120]
     fields = {
-        1: 100,
-        2: {
-            1: int(bot_uid),
-            2: text,
-            3: int(channel),
-        },
+        1: 100, 2: {1: int(bot_uid), 2: text, 3: int(channel)},
     }
     return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
 
@@ -622,16 +888,24 @@ def ExtractMajorLogin(ml_resp):
 def login_account(acc_uid, acc_pass):
     td = GeT_AccEss(acc_uid, acc_pass)
     if not td:
+        _stats_inc("logins_fail")
+        _meta_set_status(acc_uid, "dead")
         return None
     access_token = td["access_token"]; open_id = td["open_id"]
     if not access_token or not open_id:
+        _stats_inc("logins_fail")
+        _meta_set_status(acc_uid, "dead")
         return None
     login_payload = PyL(access_token, open_id)
     ml = MajorLogin(login_payload)
     if not ml:
+        _stats_inc("logins_fail")
+        _meta_set_status(acc_uid, "dead")
         return None
     ad = ExtractMajorLogin(ml)
     if not ad:
+        _stats_inc("logins_fail")
+        _meta_set_status(acc_uid, "dead")
         return None
 
     jwt = ad["jwt"]; ts = ad["ts"]; key = ad["key"]; iv = ad["iv"]
@@ -642,6 +916,8 @@ def login_account(acc_uid, acc_pass):
 
     ld = GeTLoginDaTa(url, login_payload, jwt)
     if not ld:
+        _stats_inc("logins_fail")
+        _meta_set_status(acc_uid, "dead")
         return None
     gl = Parse_ProToBuF(ld)
 
@@ -655,11 +931,15 @@ def login_account(acc_uid, acc_pass):
     player_name = gs(4) or ""
     func_addr = gs(14); info_addr = gs(32)
     if not func_addr or not info_addr:
+        _stats_inc("logins_fail")
+        _meta_set_status(acc_uid, "dead")
         return None
     ip, port = func_addr.split(":")
     ip2, port2 = info_addr.split(":")
     if not account_id:
         account_id = gi(1) or gi(5) or 0
+    _stats_inc("logins_ok")
+    _meta_set_status(acc_uid, "alive")
     return {
         "uid": account_id, "jwt": jwt, "ts": ts, "key": key, "iv": iv,
         "ip": ip, "port": port, "ip2": ip2, "port2": port2,
@@ -864,7 +1144,7 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                                 s.sendall(pkt)
                                 result["welcomed"] += 1
                                 _watch_push_event("welcome", uid=nu)
-                            except Exception as ex:
+                            except Exception:
                                 _watch_push_event("welcome_fail", uid=nu)
 
                 except socket.timeout:
@@ -949,7 +1229,7 @@ def run_one_account(session_data, team_code, barrier, deadline,
 
 
 # ═══════════════════════════════════════════════════════════
-#  💥  SPAM MODE
+#  💥  SPAM / 🌍  BLITZ
 # ═══════════════════════════════════════════════════════════
 
 def _SpamCycle(session_data, team_code, stop_event, rate, duration):
@@ -980,7 +1260,6 @@ def _SpamCycle(session_data, team_code, stop_event, rate, duration):
                 if stop_event.is_set(): break
                 try:
                     s.sendall(join_pkt); joins += 1
-                    _spam_push("join", uid)
                 except Exception:
                     _spam_push("error", uid); break
 
@@ -990,7 +1269,6 @@ def _SpamCycle(session_data, team_code, stop_event, rate, duration):
                 if stop_event.is_set(): break
                 try:
                     s.sendall(exit_pkt); exits += 1
-                    _spam_push("exit", uid)
                 except Exception:
                     _spam_push("error", uid); break
 
@@ -1009,10 +1287,6 @@ def _SpamCycle(session_data, team_code, stop_event, rate, duration):
             pass
     return {"uid": uid, "joins": joins, "exits": exits, "cycles": cycles}
 
-
-# ═══════════════════════════════════════════════════════════
-#  🌍  GLOBAL BLITZ
-# ═══════════════════════════════════════════════════════════
 
 def _BlitzWorker(session_data, team_code, stop_event, linger_s, chat_msg):
     uid = session_data["uid"]
@@ -1096,7 +1370,7 @@ def _BlitzWorker(session_data, team_code, stop_event, linger_s, chat_msg):
 
 
 # ═══════════════════════════════════════════════════════════
-#  🎨  CSS
+#  🎨  CSS — upgraded
 # ═══════════════════════════════════════════════════════════
 
 BASE_CSS = """
@@ -1104,17 +1378,21 @@ BASE_CSS = """
 :root{--bg:#06060a;--bg-2:#0d0d14;--card:#12121b;--card-2:#1a1a26;
  --border:#25253a;--text:#eaeaf2;--muted:#6f6f88;
  --xore-1:#8b5cf6;--xore-2:#06b6d4;--xore-3:#ec4899;
- --success:#10f098;--warn:#f5b800;--error:#f43f5e}
+ --success:#10f098;--warn:#f5b800;--error:#f43f5e;
+ --row-h:44px}
+body.light{--bg:#f5f5fa;--bg-2:#ffffff;--card:#ffffff;--card-2:#f0f0f5;
+ --border:#dcdce8;--text:#101018;--muted:#6b6b80}
 html,body{background:var(--bg);color:var(--text);
  font-family:'Cairo','JetBrains Mono',system-ui,sans-serif;
- min-height:100vh;line-height:1.65}
+ min-height:100vh;line-height:1.65;transition:background .3s,color .3s}
 body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;
  background:radial-gradient(circle at 15% 5%,rgba(139,92,246,.14),transparent 45%),
  radial-gradient(circle at 85% 95%,rgba(6,182,212,.14),transparent 45%)}
+body.light::before{display:none}
 a{color:var(--xore-2);text-decoration:none}
 a:hover{color:var(--xore-3)}
-.container{max-width:1180px;margin:0 auto;padding:32px 20px 80px}
-.header{text-align:center;margin-bottom:40px;padding:40px 20px;position:relative}
+.container{max-width:1280px;margin:0 auto;padding:32px 20px 80px}
+.header{text-align:center;margin-bottom:36px;padding:36px 20px;position:relative}
 .header::after{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%);
  width:80px;height:2px;background:linear-gradient(90deg,transparent,var(--xore-1),var(--xore-2),transparent)}
 .logo{font-size:56px;font-weight:900;letter-spacing:14px;margin-bottom:6px;
@@ -1122,70 +1400,80 @@ a:hover{color:var(--xore-3)}
  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
  filter:drop-shadow(0 0 40px rgba(139,92,246,.45))}
 .tagline{color:var(--muted);font-size:12px;letter-spacing:6px;text-transform:uppercase;font-weight:700}
-.status-bar{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:22px;flex-wrap:wrap}
-.pill{display:inline-flex;align-items:center;gap:8px;padding:7px 16px;
+.status-bar{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:20px;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;
  border-radius:999px;background:var(--card);border:1px solid var(--border);
- font-size:12px;font-weight:700;color:var(--muted)}
+ font-size:11.5px;font-weight:700;color:var(--muted)}
 .pill.live{color:var(--success);border-color:rgba(16,240,152,.3)}
 .pill.live .dot{background:var(--success);box-shadow:0 0 12px var(--success);animation:pulse 2s infinite}
+.pill.busy{color:var(--warn);border-color:rgba(245,184,0,.3)}
+.pill.busy .dot{background:var(--warn);box-shadow:0 0 12px var(--warn);animation:pulse 1s infinite}
 .dot{width:8px;height:8px;border-radius:50%}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-.hero{display:flex;justify-content:center;margin:40px 0}
+.hero{display:flex;justify-content:center;margin:36px 0}
 .hero-stat{background:var(--card);border:1px solid var(--border);border-radius:24px;
- padding:40px 60px;text-align:center;position:relative;overflow:hidden;min-width:280px}
+ padding:36px 56px;text-align:center;position:relative;overflow:hidden;min-width:280px}
 .hero-stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
  background:linear-gradient(90deg,var(--xore-1),var(--xore-3),var(--xore-2))}
 .hero-stat .lbl{font-size:12px;color:var(--muted);text-transform:uppercase;
  letter-spacing:2px;font-weight:800;margin-bottom:12px}
-.hero-stat .val{font-size:72px;font-weight:900;line-height:1;
+.hero-stat .val{font-size:68px;font-weight:900;line-height:1;
  background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:18px;margin-bottom:32px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:16px;margin-bottom:28px}
 .stat{background:var(--card);border:1px solid var(--border);border-radius:18px;
- padding:22px;position:relative;overflow:hidden;transition:transform .15s}
+ padding:20px;position:relative;overflow:hidden;transition:transform .15s}
 .stat:hover{transform:translateY(-3px)}
 .stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
  background:linear-gradient(90deg,var(--xore-1),var(--xore-3),var(--xore-2))}
 .stat .label{font-size:11px;color:var(--muted);text-transform:uppercase;
  letter-spacing:1.5px;margin-bottom:10px;font-weight:800}
-.stat .value{font-size:32px;font-weight:900;line-height:1}
+.stat .value{font-size:30px;font-weight:900;line-height:1}
 .stat .value.purple{background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .stat .value.cyan{background:linear-gradient(135deg,var(--xore-2),var(--xore-1));
  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .stat .value.green{color:var(--success)}
 .stat .value.red{color:var(--error)}
+.stat .value.gold{background:linear-gradient(135deg,#f5b800,#d97706);
+ -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .card{background:var(--card);border:1px solid var(--border);border-radius:20px;
- padding:26px;margin-bottom:22px}
-.card h2{font-size:17px;font-weight:800;margin-bottom:20px;
- display:flex;align-items:center;gap:12px}
+ padding:24px;margin-bottom:20px;transition:background .3s,border-color .3s}
+.card h2{font-size:16.5px;font-weight:800;margin-bottom:18px;
+ display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .card h2::before{content:'';width:5px;height:22px;border-radius:3px;
  background:linear-gradient(180deg,var(--xore-1),var(--xore-2))}
-.input-row{display:flex;gap:12px;flex-wrap:wrap}
-input[type=text],textarea{flex:1;background:var(--bg-2);
- border:1.5px solid var(--border);border-radius:12px;padding:15px 18px;
- color:var(--text);font-family:inherit;font-size:14px;outline:none;
- transition:border-color .15s,box-shadow .15s;min-width:200px}
-input[type=text]:focus,textarea:focus{border-color:var(--xore-1);
+.input-row{display:flex;gap:10px;flex-wrap:wrap}
+input[type=text],input[type=search],input[type=password],textarea,select{
+ flex:1;background:var(--bg-2);border:1.5px solid var(--border);border-radius:12px;
+ padding:14px 16px;color:var(--text);font-family:inherit;font-size:14px;outline:none;
+ transition:border-color .15s,box-shadow .15s;min-width:180px}
+select{cursor:pointer}
+input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,
+textarea:focus,select:focus{border-color:var(--xore-1);
  box-shadow:0 0 0 4px rgba(139,92,246,.12)}
-textarea{resize:vertical;min-height:180px;font-family:'JetBrains Mono',monospace;
+textarea{resize:vertical;min-height:200px;font-family:'JetBrains Mono',monospace;
  font-size:12.5px;line-height:1.7}
-button,.btn{display:inline-block;padding:15px 30px;border-radius:12px;
- font-weight:800;font-family:inherit;font-size:14px;letter-spacing:.8px;
+button,.btn{display:inline-block;padding:14px 26px;border-radius:12px;
+ font-weight:800;font-family:inherit;font-size:13.5px;letter-spacing:.6px;
  border:none;cursor:pointer;transition:all .18s;
  background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
  color:#fff;box-shadow:0 8px 24px -8px rgba(139,92,246,.7);text-align:center}
 button:hover,.btn:hover{transform:translateY(-2px)}
 button:disabled{opacity:.5;cursor:not-allowed;transform:none}
+button.sm{padding:8px 14px;font-size:12px;border-radius:8px}
+button.xs{padding:5px 9px;font-size:11px;border-radius:6px}
 button.ghost,.btn.ghost{background:transparent;color:var(--xore-2);
  border:1.5px solid var(--xore-2);box-shadow:none}
 button.danger{background:linear-gradient(135deg,var(--error),#b91c1c)}
 button.green{background:linear-gradient(135deg,var(--success),#059669);color:#04140c}
 button.warn{background:linear-gradient(135deg,var(--warn),#c2410c);color:#1a1000}
 button.gold{background:linear-gradient(135deg,#f5b800,#d97706);color:#1a1000}
+button.gray{background:linear-gradient(135deg,#6f6f88,#3f3f55)}
+button.cyan{background:linear-gradient(135deg,#06b6d4,#0891b2)}
 .btn-full{width:100%;padding:18px;font-size:16px;letter-spacing:2px}
-.badge{display:inline-block;padding:5px 13px;border-radius:7px;font-size:11px;
- font-weight:800;letter-spacing:.6px;text-transform:uppercase}
+.badge{display:inline-block;padding:4px 11px;border-radius:7px;font-size:10.5px;
+ font-weight:800;letter-spacing:.5px;text-transform:uppercase}
 .badge.success{background:rgba(16,240,152,.14);color:var(--success);
  border:1px solid rgba(16,240,152,.35)}
 .badge.error{background:rgba(244,63,94,.14);color:var(--error);
@@ -1196,19 +1484,26 @@ button.gold{background:linear-gradient(135deg,#f5b800,#d97706);color:#1a1000}
  border:1px solid rgba(6,182,212,.35)}
 .badge.purple{background:rgba(139,92,246,.14);color:var(--xore-1);
  border:1px solid rgba(139,92,246,.35)}
-.table{width:100%;border-collapse:collapse;font-size:13px}
-.table th,.table td{text-align:left;padding:12px 14px;border-bottom:1px solid var(--border)}
+.badge.off{background:rgba(111,111,136,.14);color:var(--muted);
+ border:1px solid rgba(111,111,136,.35)}
+.table{width:100%;border-collapse:collapse;font-size:12.5px}
+.table th,.table td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border)}
 .table th{color:var(--muted);font-weight:800;text-transform:uppercase;
- font-size:11px;letter-spacing:1.2px;background:var(--bg-2)}
+ font-size:10.5px;letter-spacing:1.1px;background:var(--bg-2);position:sticky;top:0;z-index:2}
 .table tr:hover td{background:var(--card-2)}
-.mono{font-family:'JetBrains Mono',monospace;font-size:12.5px}
+.table tr.disabled td{opacity:.45}
+.table tr.selected td{background:rgba(139,92,246,.08)}
+.mono{font-family:'JetBrains Mono',monospace;font-size:12px}
+.scroll-y{max-height:420px;overflow-y:auto;border:1px solid var(--border);border-radius:12px}
+.scroll-y.tall{max-height:620px}
 .hint{color:var(--muted);font-size:12.5px;margin-top:14px;padding:14px 18px;
  background:var(--bg-2);border-left:3px solid var(--xore-1);border-radius:8px;line-height:1.7}
-.hint code{background:#000;padding:3px 8px;border-radius:5px;color:var(--xore-2);font-size:12px}
+.hint code{background:#000;padding:2px 8px;border-radius:5px;color:var(--xore-2);font-size:12px}
+body.light .hint code{background:#e8e8f0;color:var(--xore-1)}
 .result-box{display:flex;align-items:center;gap:20px;flex-wrap:wrap;
- padding:22px;background:var(--bg-2);border-radius:16px;margin-top:16px;
+ padding:20px;background:var(--bg-2);border-radius:16px;margin-top:14px;
  border:1px solid var(--border)}
-.result-box .big{font-size:38px;font-weight:900;line-height:1}
+.result-box .big{font-size:36px;font-weight:900;line-height:1}
 .result-box .big.green{color:var(--success)}
 .result-box .big.red{color:var(--error)}
 .result-box .big.purple{background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
@@ -1218,13 +1513,13 @@ button.gold{background:linear-gradient(135deg,#f5b800,#d97706);color:#1a1000}
 .result-box .big.gold{background:linear-gradient(135deg,#f5b800,#d97706);
  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .result-box .label{font-size:11px;color:var(--muted);
- text-transform:uppercase;letter-spacing:1.4px;font-weight:800;margin-bottom:6px}
+ text-transform:uppercase;letter-spacing:1.3px;font-weight:800;margin-bottom:6px}
 .progress-outer{height:10px;background:var(--bg-2);border-radius:99px;overflow:hidden;
  border:1px solid var(--border);margin-top:12px}
 .progress-inner{height:100%;width:0%;
  background:linear-gradient(90deg,#f5b800,#ec4899,#8b5cf6);
  transition:width .3s;border-radius:99px}
-footer{margin-top:70px;padding-top:28px;border-top:1px solid var(--border);
+footer{margin-top:60px;padding-top:26px;border-top:1px solid var(--border);
  text-align:center;color:var(--muted);font-size:12.5px}
 footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
  background:linear-gradient(135deg,var(--xore-1),var(--xore-3),var(--xore-2));
@@ -1234,25 +1529,106 @@ footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
  border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;
  vertical-align:middle;margin-left:8px}
 @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-.animate-in{animation:fadeIn .4s ease-out}
+.animate-in{animation:fadeIn .35s ease-out}
 .blitz{border-color:rgba(245,184,0,.5);
  background:linear-gradient(180deg,rgba(245,184,0,.06),transparent)}
 .admin-tag{display:inline-block;padding:3px 10px;background:linear-gradient(135deg,#8b5cf6,#ec4899);
- color:#fff;border-radius:6px;font-size:10px;font-weight:900;letter-spacing:1px;
- margin-right:8px}
-@media (max-width:600px){
- .container{padding:20px 14px 50px}
+ color:#fff;border-radius:6px;font-size:10px;font-weight:900;letter-spacing:1px;margin-left:8px}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+.toolbar input[type=search]{flex:1;min-width:220px;padding:10px 14px}
+.preset-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;
+ background:var(--bg-2);border:1px solid var(--border);border-radius:99px;
+ font-size:12px;font-weight:700;cursor:pointer;color:var(--muted);transition:all .15s}
+.preset-chip:hover{border-color:var(--xore-2);color:var(--xore-2)}
+.preset-chip button{background:transparent;padding:0;color:var(--error);
+ font-size:14px;line-height:1;box-shadow:none;margin:0;min-width:0}
+.log-line{padding:6px 10px;border-bottom:1px solid var(--border);
+ font-family:'JetBrains Mono',monospace;font-size:11.5px;display:flex;gap:10px;align-items:center}
+.log-line:last-child{border-bottom:none}
+.log-line .time{color:var(--muted);flex-shrink:0}
+.log-line .k{font-weight:800;flex-shrink:0}
+.log-line .k.ghost{color:var(--xore-1)}
+.log-line .k.blitz{color:var(--warn)}
+.log-line .k.spam{color:var(--error)}
+.log-line .k.watch{color:var(--success)}
+.log-line .k.acct{color:var(--xore-2)}
+.log-line .k.check{color:var(--xore-3)}
+.log-line .msg{color:var(--text);opacity:.85;flex:1;overflow:hidden;
+ text-overflow:ellipsis;white-space:nowrap}
+
+/* toasts */
+.toast-wrap{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);
+ display:flex;flex-direction:column;gap:10px;z-index:99999;pointer-events:none;
+ max-width:92vw}
+.toast{pointer-events:auto;background:var(--card);border:1px solid var(--border);
+ border-radius:12px;padding:12px 20px;font-weight:800;color:var(--text);
+ box-shadow:0 10px 40px rgba(0,0,0,.35);display:flex;align-items:center;gap:10px;
+ animation:fadeIn .25s ease-out;min-width:240px;max-width:600px}
+.toast.success{border-color:rgba(16,240,152,.5);color:var(--success)}
+.toast.error{border-color:rgba(244,63,94,.5);color:var(--error)}
+.toast.warn{border-color:rgba(245,184,0,.5);color:var(--warn)}
+.toast.info{border-color:rgba(6,182,212,.5);color:var(--xore-2)}
+
+/* running modules indicator */
+.mods{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 20px}
+.mod{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;
+ border-radius:99px;font-size:11px;font-weight:800;letter-spacing:.5px;
+ text-transform:uppercase;background:var(--bg-2);border:1px solid var(--border);
+ color:var(--muted);transition:all .2s}
+.mod.on{color:var(--success);border-color:rgba(16,240,152,.6);
+ box-shadow:0 0 16px rgba(16,240,152,.2)}
+.mod.on .dot{background:var(--success);box-shadow:0 0 10px var(--success);
+ animation:pulse 1.5s infinite}
+
+/* checkbox */
+.chk{width:18px;height:18px;accent-color:var(--xore-1);cursor:pointer}
+
+/* filter chips */
+.filters{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+.fchip{padding:5px 12px;border-radius:99px;background:var(--bg-2);
+ border:1px solid var(--border);font-size:11.5px;font-weight:700;
+ cursor:pointer;color:var(--muted);transition:all .15s}
+.fchip:hover{border-color:var(--xore-2);color:var(--xore-2)}
+.fchip.active{background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
+ color:#fff;border-color:transparent}
+
+/* pagination */
+.pager{display:flex;gap:6px;align-items:center;justify-content:center;
+ margin-top:12px;flex-wrap:wrap;font-size:12px;color:var(--muted);font-weight:700}
+.pager button{padding:6px 12px;font-size:12px;border-radius:8px}
+
+/* reveal pw */
+.pw-cell{letter-spacing:1px;user-select:all}
+.pw-hidden{filter:blur(4px);user-select:none}
+
+/* batch bar */
+.batch-bar{display:none;align-items:center;gap:10px;padding:12px 16px;
+ background:linear-gradient(135deg,rgba(139,92,246,.12),rgba(236,72,153,.12));
+ border:1px solid rgba(139,92,246,.4);border-radius:12px;margin-bottom:12px;
+ flex-wrap:wrap}
+.batch-bar.on{display:flex}
+.batch-bar .count{font-weight:900;color:var(--xore-1)}
+
+/* inline form result */
+.inline-result{margin-top:14px;padding:0;border-radius:12px;overflow:hidden;
+ max-height:0;transition:max-height .3s ease-out}
+.inline-result.on{max-height:400px}
+
+@media (max-width:640px){
+ .container{padding:18px 12px 50px}
  .logo{font-size:38px;letter-spacing:8px}
- .hero-stat{padding:30px 40px}
- .hero-stat .val{font-size:56px}
- .stat .value{font-size:26px}
- .card{padding:18px}
- button,.btn{padding:13px 22px;font-size:13px}
+ .hero-stat{padding:28px 36px}
+ .hero-stat .val{font-size:52px}
+ .stat .value{font-size:24px}
+ .card{padding:16px}
+ button,.btn{padding:12px 20px;font-size:13px}
+ .table th,.table td{padding:8px 8px;font-size:11.5px}
+ .toast{min-width:auto;font-size:12.5px;padding:10px 14px}
 }
 """
 
 
-def _wrap(title, body):
+def _wrap(title, body, show_admin=True):
     return f"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -1269,19 +1645,55 @@ def _wrap(title, body):
 {body}
 <footer>
   <div class="xore">XORE</div>
-  <div>Powered by XORE · Free Fire OB55 · ME · v4.1</div>
+  <div>Powered by XORE · Free Fire OB55 · ME · v5.0 · DEV EDITION</div>
 </footer>
 </div>
+<div class="toast-wrap" id="toastWrap"></div>
+<script>
+window.XORE_TOAST = function(msg, kind) {{
+  kind = kind || 'info';
+  const wrap = document.getElementById('toastWrap');
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  const icons = {{success:'✅',error:'❌',warn:'⚠️',info:'ℹ️'}};
+  el.innerHTML = '<span>' + (icons[kind]||'') + '</span><span>' + msg + '</span>';
+  wrap.appendChild(el);
+  if (window.XORE_SOUND && window.XORE_SOUNDON) {{
+    try {{
+      const ctx = window.XORE_SOUND;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.frequency.value = kind === 'error' ? 220 : (kind === 'success' ? 880 : 550);
+      osc.type = 'sine';
+      gain.gain.value = 0.05;
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.1);
+    }} catch(e) {{}}
+  }}
+  setTimeout(() => {{
+    el.style.transition = 'opacity .3s, transform .3s';
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(10px)';
+    setTimeout(() => el.remove(), 320);
+  }}, 3200);
+}};
+document.addEventListener('click', () => {{
+  if (!window.XORE_SOUND && window.AudioContext) {{
+    try {{ window.XORE_SOUND = new AudioContext(); }} catch(e) {{}}
+  }}
+}}, {{ once: true }});
+</script>
 </body>
 </html>"""
 
 
 # ═══════════════════════════════════════════════════════════
-#  📄  PUBLIC PAGE — GHOST ONLY
+#  📄  PUBLIC PAGE
 # ═══════════════════════════════════════════════════════════
 
 def render_public():
-    count = len(get_accounts())
+    count = count_accounts()
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
@@ -1375,6 +1787,10 @@ async function startBot(e) {{
     document.getElementById('progressStage').textContent = '✅ اكتمل';
     setTimeout(() => {{ progressWrap.style.display = 'none'; }}, 800);
     renderResult(data);
+    if (window.XORE_TOAST) {{
+      const ok = (data.accounts_logged || 0) > 0;
+      XORE_TOAST(ok ? ('نجح — ' + data.accounts_logged + ' حساب') : 'فشل التشغيل', ok ? 'success' : 'error');
+    }}
   }} catch (err) {{
     clearInterval(timerInterval);
     progressWrap.style.display = 'none';
@@ -1382,6 +1798,7 @@ async function startBot(e) {{
       <div class="result-box animate-in" style="border-color:var(--error)">
         <div class="label" style="color:var(--error)">خطأ: ${{err.message}}</div>
       </div>`;
+    if (window.XORE_TOAST) XORE_TOAST(err.message, 'error');
   }} finally {{
     btn.disabled = false;
     btn.innerHTML = '👻 بدء Ghost';
@@ -1452,13 +1869,15 @@ function renderResult(r) {{
 
 
 # ═══════════════════════════════════════════════════════════
-#  📄  ADMIN PAGE
+#  📄  ADMIN PAGE — full upgrade
 # ═══════════════════════════════════════════════════════════
 
 def render_admin(key):
-    accs = get_accounts()
-    count = len(accs)
+    count = count_accounts()
     live = get_live_status()
+    stats = _stats_snapshot()
+    ws = _watch_snapshot(); sp = _spam_snapshot()
+    bz = _blitz_snapshot(); gs = _ghost_snapshot()
 
     if live["checked"] and not live["checking"]:
         live_html = f"""
@@ -1478,894 +1897,683 @@ def render_admin(key):
     else:
         live_html = '<div class="result-box"><div class="label">لم يتم الفحص بعد</div></div>'
 
-    rows = "".join(
-        f'<tr><td class="mono">{i+1}</td><td class="mono">{u}</td>'
-        f'<td class="mono">{p[:10]}…{p[-6:] if len(p)>16 else ""}</td></tr>'
-        for i, (u, p) in enumerate(accs[:60])
-    )
-    more = (f'<tr><td colspan="3" style="text-align:center;color:var(--muted);'
-            f'padding:16px">… و {count-60} إضافي</td></tr>') if count > 60 else ""
+    mods_html = f"""
+    <div class="mods">
+      <span class="mod {'on' if gs['active'] else ''}">
+        <span class="dot"></span> Ghost</span>
+      <span class="mod {'on' if bz['active'] else ''}">
+        <span class="dot"></span> Blitz</span>
+      <span class="mod {'on' if sp['active'] else ''}">
+        <span class="dot"></span> Spam</span>
+      <span class="mod {'on' if ws['active'] else ''}">
+        <span class="dot"></span> Watch</span>
+      <span class="mod {'on' if live['checking'] else ''}">
+        <span class="dot"></span> Check</span>
+    </div>
+    """
 
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
-  <div class="tagline"><span class="admin-tag">DEV</span> ADMIN PANEL · v4.1 · ALL FEATURES</div>
+  <div class="tagline"><span class="admin-tag">DEV v5.0</span> CONTROL PANEL</div>
   <div class="status-bar">
     <div class="pill live"><span class="dot"></span> ADMIN</div>
-    <div class="pill">إجمالي: {count}</div>
+    <div class="pill">إجمالي: <span id="hdrTotal">{count}</span></div>
     <div class="pill">الحد: {MAX_ACCOUNTS}</div>
     <div class="pill">{HB_PER_ACCOUNT} HB/حساب</div>
     <div class="pill">Speed 6x</div>
+    <button class="sm ghost" onclick="toggleTheme()" id="themeBtn">🌙</button>
+    <button class="sm ghost" onclick="toggleSound()" id="soundBtn">🔇</button>
+    <button class="sm ghost" onclick="toggleAutoRefresh()" id="arBtn">⏸ تلقائي</button>
   </div>
 </div>
 
-<div class="stats">
-  <div class="stat"><div class="label">الحسابات المحمّلة</div>
-    <div class="value purple">{count}</div></div>
-  <div class="stat"><div class="label">حسابات شغّالة</div>
-    <div class="value green">{live["alive"] if live["checked"] else "—"}</div></div>
-  <div class="stat"><div class="label">حسابات معطّلة</div>
-    <div class="value red">{live["dead"] if live["checked"] else "—"}</div></div>
-  <div class="stat"><div class="label">Global Blitz حد</div>
-    <div class="value cyan">{BLITZ_ACCOUNTS_MAX}</div></div>
+{mods_html}
+
+<div class="stats" id="statsGrid">
+  <div class="stat"><div class="label">حسابات محمّلة</div>
+    <div class="value purple" id="s-total">{count}</div></div>
+  <div class="stat"><div class="label">شغّالة</div>
+    <div class="value green" id="s-alive">{live["alive"] if live["checked"] else "—"}</div></div>
+  <div class="stat"><div class="label">معطّلة</div>
+    <div class="value red" id="s-dead">{live["dead"] if live["checked"] else "—"}</div></div>
+  <div class="stat"><div class="label">Ghost runs</div>
+    <div class="value cyan" id="s-ghost">{stats.get("ghost_runs",0)}</div></div>
+  <div class="stat"><div class="label">Blitz runs</div>
+    <div class="value gold" id="s-blitz">{stats.get("blitz_runs",0)}</div></div>
+  <div class="stat"><div class="label">Spam runs</div>
+    <div class="value red" id="s-spam">{stats.get("spam_runs",0)}</div></div>
+  <div class="stat"><div class="label">Watch runs</div>
+    <div class="value green" id="s-watch">{stats.get("watch_runs",0)}</div></div>
+  <div class="stat"><div class="label">Uptime</div>
+    <div class="value cyan" style="font-size:22px" id="s-uptime">{stats.get("uptime",0)}s</div></div>
 </div>
 
-<!-- GLOBAL BLITZ -->
+<!-- BLITZ -->
 <div class="card blitz">
   <h2 style="color:var(--warn)">🌍 Global Blitz — انفجار عالمي</h2>
-  <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
-    <strong style="color:var(--warn)">{BLITZ_ACCOUNTS_MAX} حساب</strong> يدخلون <strong>العالمية</strong> عشوائياً،
-    يرسلون رسالة، ثم <strong>يخرجون بعد {BLITZ_LINGER_S} ثانية</strong>.
-  </p>
   <div class="input-row">
     <input type="text" id="blitzTeam" placeholder="كود الفريق..."
-           minlength="1" maxlength="20" autocomplete="off">
+           minlength="1" maxlength="20" autocomplete="off" list="presetTeams">
     <input type="text" id="blitzCount" placeholder="عدد"
-           value="{BLITZ_ACCOUNTS_MAX}" style="max-width:110px">
+           value="{BLITZ_ACCOUNTS_MAX}" style="max-width:100px">
     <input type="text" id="blitzLinger" placeholder="مدة (s)"
-           value="{BLITZ_LINGER_S}" style="max-width:110px">
+           value="{BLITZ_LINGER_S}" style="max-width:100px">
     <input type="text" id="blitzMsg" placeholder="الرسالة"
-           value="{WELCOME_MSG}" style="min-width:200px">
+           value="{WELCOME_MSG}" style="min-width:180px">
   </div>
-  <div style="margin-top:14px;display:flex;gap:12px;flex-wrap:wrap">
+  <div class="toolbar" style="margin-top:12px">
     <button onclick="startBlitz()" id="blitzBtn" class="gold" style="flex:1">
-      🌍 ابدأ الانفجار العالمي
+      🌍 ابدأ الانفجار
     </button>
-    <button onclick="stopBlitz()" style="background:linear-gradient(135deg,#6f6f88,#3f3f55)">
-      ⏹ إيقاف</button>
+    <button onclick="stopBlitz()" class="gray" style="flex:0">⏹ إيقاف</button>
+    <button onclick="saveTeam('blitzTeam')" class="sm cyan">⭐ احفظ كود</button>
   </div>
+  <div id="blitzPresets" style="margin-top:10px"></div>
   <div id="blitzStatus" style="margin-top:16px"></div>
 </div>
 
 <!-- GHOST -->
 <div class="card">
-  <h2>👻 تشغيل Ghost (4HB · Speed 6x)</h2>
-  <form method="get" action="/start" target="_blank">
-    <input type="hidden" name="key" value="{key}">
-    <div class="input-row">
-      <input type="text" name="team" placeholder="كود الفريق..."
-             required minlength="1" maxlength="20" autocomplete="off">
-      <button type="submit">👻 START</button>
-    </div>
-  </form>
-</div>
-
-<!-- CHECK -->
-<div class="card">
-  <h2>🔍 فحص الحسابات الحية</h2>
-  <button onclick="checkAccounts()" id="checkBtn">▶ فحص الآن</button>
-  <div id="liveResult">{live_html}</div>
+  <h2>👻 Ghost (4HB · Speed 6x)</h2>
+  <div class="input-row">
+    <input type="text" id="ghostTeam" placeholder="كود الفريق..."
+           minlength="1" maxlength="20" autocomplete="off" list="presetTeams">
+    <button onclick="startGhost()" id="ghostBtn">👻 بدء Ghost</button>
+    <button onclick="saveTeam('ghostTeam')" class="sm cyan">⭐ احفظ كود</button>
+  </div>
+  <div id="ghostResult" style="margin-top:14px"></div>
 </div>
 
 <!-- WATCH -->
 <div class="card">
-  <h2>👋 وضع الترحيب التلقائي</h2>
-  <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
-    البوت يبقى متصل ويترحّب بكل عضو جديد:
-    <code style="background:#000;padding:2px 8px;border-radius:4px;
-          color:var(--xore-2)">{WELCOME_MSG}</code>
-    <span style="color:var(--muted);font-size:12px">
-      (قناة: {WELCOME_CHANNEL} — 1=فريق, 2=عالم, 3=سكواد)
-    </span>
+  <h2>👋 Auto-Welcome</h2>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:12px">
+    الترحيب: <code style="background:#000;padding:2px 8px;border-radius:4px;color:var(--xore-2)">{WELCOME_MSG}</code>
+    · قناة: {WELCOME_CHANNEL}
   </p>
   <div class="input-row">
     <input type="text" id="watchTeam" placeholder="كود الفريق..."
-           minlength="1" maxlength="20" autocomplete="off">
-    <button onclick="startWatch()" id="watchBtn" class="green">👋 بدء الترحيب</button>
+           minlength="1" maxlength="20" autocomplete="off" list="presetTeams">
+    <button onclick="startWatch()" id="watchBtn" class="green">👋 ابدأ</button>
     <button onclick="stopWatch()" class="danger">⏹ إيقاف</button>
+    <button onclick="saveTeam('watchTeam')" class="sm cyan">⭐ احفظ</button>
   </div>
-  <div id="watchStatus" style="margin-top:16px"></div>
+  <div id="watchStatus" style="margin-top:14px"></div>
 </div>
 
 <!-- SPAM -->
 <div class="card" style="border-color:rgba(244,63,94,.5)">
-  <h2 style="color:var(--error)">💥 سبام دخول وخروج</h2>
+  <h2 style="color:var(--error)">💥 Spam JOIN/EXIT</h2>
   <div class="input-row">
     <input type="text" id="spamTeam" placeholder="كود الفريق..."
-           minlength="1" maxlength="20" autocomplete="off">
+           minlength="1" maxlength="20" autocomplete="off" list="presetTeams">
     <input type="text" id="spamRate" placeholder="تأخير/cycle (s)"
-           value="{SPAM_RATE}" style="max-width:140px">
-    <input type="text" id="spamDuration" placeholder="المدة (s)"
-           value="{SPAM_DURATION}" style="max-width:140px">
+           value="{SPAM_RATE}" style="max-width:120px">
+    <input type="text" id="spamDuration" placeholder="مدة (s)"
+           value="{SPAM_DURATION}" style="max-width:120px">
     <input type="text" id="spamAccounts" placeholder="حسابات"
-           value="{min(SPAM_ACCOUNTS_MAX, 30)}" style="max-width:140px">
+           value="{min(SPAM_ACCOUNTS_MAX, 30)}" style="max-width:120px">
   </div>
-  <div style="margin-top:14px;display:flex;gap:12px;flex-wrap:wrap">
-    <button onclick="startSpam()" id="spamBtn" class="danger">💥 بدء السبام</button>
-    <button onclick="stopSpam()" style="background:linear-gradient(135deg,#6f6f88,#3f3f55)">
-      ⏹ إيقاف السبام</button>
+  <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+    <button onclick="startSpam()" id="spamBtn" class="danger">💥 بدء</button>
+    <button onclick="stopSpam()" class="gray">⏹ إيقاف</button>
+    <button onclick="saveTeam('spamTeam')" class="sm cyan">⭐ احفظ كود</button>
   </div>
-  <div id="spamStatus" style="margin-top:16px"></div>
+  <div id="spamStatus" style="margin-top:14px"></div>
 </div>
 
-<!-- ACCOUNTS -->
+<!-- CHECK -->
 <div class="card">
-  <h2>➕ إدارة الحسابات</h2>
-  <form method="post" action="/replace">
-    <input type="hidden" name="key" value="{key}">
-    <textarea name="raw"
-placeholder="password1:uid1&#10;password2:uid2&#10;... (حتى {MAX_ACCOUNTS})"></textarea>
-    <div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap">
-      <button type="submit" name="mode" value="replace" class="danger">🔄 استبدال</button>
-      <button type="submit" name="mode" value="append" class="green">➕ إضافة</button>
-    </div>
-  </form>
-  <div class="hint">الصيغة: <code>password:uid</code> — سطر لكل حساب.</div>
+  <h2>🔍 فحص الحسابات</h2>
+  <div class="toolbar">
+    <button onclick="checkAccounts()" id="checkBtn">▶ فحص الكل</button>
+  </div>
+  <div id="liveResult">{live_html}</div>
 </div>
 
+<!-- ACCOUNTS MANAGER (AJAX) -->
 <div class="card">
-  <h2>👥 قائمة الحسابات ({count})</h2>
-  <table class="table">
-    <thead><tr><th style="width:50px">#</th><th>UID</th><th>Password</th></tr></thead>
-    <tbody>{rows}{more}</tbody>
-  </table>
+  <h2>👥 إدارة الحسابات <span class="badge purple" id="acctCountBadge">{count}</span></h2>
+
+  <div id="addResult" style="margin-bottom:14px"></div>
+
+  <textarea id="rawInput" placeholder="password:uid&#10;password:uid&#10;..." spellcheck="false"></textarea>
+  <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+    <button type="button" onclick="submitAccounts('append')" class="green" id="btnAppend">➕ إضافة (بدون تحديث الصفحة)</button>
+    <button type="button" onclick="submitAccounts('replace')" class="danger" id="btnReplace">🔄 استبدال الكل</button>
+    <button type="button" onclick="exportAccounts('txt')" class="cyan">⬇ TXT</button>
+    <button type="button" onclick="exportAccounts('csv')" class="cyan">⬇ CSV</button>
+    <button type="button" onclick="exportAccounts('json')" class="cyan">⬇ JSON</button>
+    <button type="button" onclick="clearAccounts()" class="gray">🗑 مسح الكل</button>
+  </div>
+  <div class="hint">
+    الصيغة: <code>password:uid</code> سطر لكل حساب. يمكن الفصل بـ <code>;</code> أو <code>,</code>.
+    التكرارات تُتجاهل تلقائياً. النتائج تظهر تحت بدون إعادة تحميل.
+  </div>
 </div>
+
+<!-- ACCOUNT LIST -->
+<div class="card">
+  <h2>📋 قائمة الحسابات</h2>
+
+  <div class="toolbar">
+    <input type="search" id="accSearch" placeholder="🔎 ابحث في UID / Alias / Note..." oninput="onSearchChange()">
+    <select id="sortSel" onchange="reloadList()" style="max-width:180px">
+      <option value="added_desc">الأحدث أولاً</option>
+      <option value="added_asc">الأقدم أولاً</option>
+      <option value="uid_asc">UID تصاعدي</option>
+      <option value="uid_desc">UID تنازلي</option>
+      <option value="alias_asc">الاسم (A-Z)</option>
+      <option value="status_alive">الحالة: شغّال</option>
+      <option value="status_dead">الحالة: معطّل</option>
+    </select>
+    <select id="pageSizeSel" onchange="reloadList()" style="max-width:100px">
+      <option value="25">25</option>
+      <option value="50" selected>50</option>
+      <option value="100">100</option>
+      <option value="200">200</option>
+    </select>
+    <button onclick="reloadList()" class="sm cyan">🔄</button>
+    <button onclick="toggleRevealAll()" class="sm gray" id="revealBtn">👁 كشف</button>
+  </div>
+
+  <div class="filters">
+    <span class="fchip active" data-filter="all" onclick="setFilter('all')">الكل</span>
+    <span class="fchip" data-filter="enabled" onclick="setFilter('enabled')">شغّال</span>
+    <span class="fchip" data-filter="disabled" onclick="setFilter('disabled')">معطّل</span>
+    <span class="fchip" data-filter="alive" onclick="setFilter('alive')">Alive</span>
+    <span class="fchip" data-filter="dead" onclick="setFilter('dead')">Dead</span>
+    <span class="fchip" data-filter="unknown" onclick="setFilter('unknown')">غير مفحوص</span>
+  </div>
+
+  <div class="batch-bar" id="batchBar">
+    <span>محدد: <span class="count" id="batchCount">0</span></span>
+    <button class="sm green" onclick="bulkOp('enable')">▶ تفعيل</button>
+    <button class="sm warn" onclick="bulkOp('disable')">⏸ تعطيل</button>
+    <button class="sm cyan" onclick="bulkOp('test')">🔍 اختبار</button>
+    <button class="sm danger" onclick="bulkOp('delete')">🗑 حذف</button>
+    <button class="sm gray" onclick="clearSelection()">✖ إلغاء</button>
+  </div>
+
+  <div class="scroll-y tall">
+    <table class="table" id="accTable">
+      <thead>
+        <tr>
+          <th style="width:34px"><input type="checkbox" class="chk" id="chkAll" onchange="toggleAll(this.checked)"></th>
+          <th style="width:48px">#</th>
+          <th>UID</th>
+          <th>Alias / Note</th>
+          <th>Password</th>
+          <th>الحالة</th>
+          <th style="width:220px">إجراءات</th>
+        </tr>
+      </thead>
+      <tbody id="accBody"><tr><td colspan="7" style="text-align:center;color:var(--muted);padding:20px">تحميل...</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="pager" id="pager"></div>
+  <div style="text-align:center;margin-top:8px;font-size:12px;color:var(--muted)" id="pagerInfo"></div>
+</div>
+
+<!-- HISTORY -->
+<div class="card">
+  <h2>🕐 سجل الجلسات (آخر 50)</h2>
+  <div class="scroll-y">
+    <table class="table" id="historyTable">
+      <thead><tr><th>الوقت</th><th>النوع</th><th>الفريق</th><th>حسابات</th></tr></thead>
+      <tbody id="historyBody"><tr><td colspan="4" style="text-align:center;color:var(--muted);padding:16px">لا يوجد سجل</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ACTIVITY LOG -->
+<div class="card">
+  <h2>📜 سجل النشاط المباشر</h2>
+  <div class="scroll-y" id="activityLog" style="max-height:340px">
+    <div style="padding:20px;text-align:center;color:var(--muted)">لا يوجد نشاط بعد...</div>
+  </div>
+</div>
+
+<datalist id="presetTeams"></datalist>
 
 <script>
-async function checkAccounts() {{
-  const btn = document.getElementById('checkBtn');
-  const out = document.getElementById('liveResult');
-  btn.disabled = true; btn.textContent = '⏳ ...';
-  out.innerHTML = '<div class="result-box"><div class="label">⏳ يفحص...</div></div>';
+const KEY = "{key}";
+const MAX_ACCOUNTS = {MAX_ACCOUNTS};
+
+// ═══════════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════════
+const UI = {{
+  page: 1, pageSize: 50, filter: 'all', sort: 'added_desc', q: '',
+  reveal: false, autoRefresh: true,
+  selected: new Set(),
+  lastList: null,
+}};
+
+// ═══════════════════════════════════════════════════════════
+//  PRESETS
+// ═══════════════════════════════════════════════════════════
+function getPresets() {{
+  try {{ return JSON.parse(localStorage.getItem('xore_presets') || '[]'); }}
+  catch {{ return []; }}
+}}
+function setPresets(arr) {{
+  localStorage.setItem('xore_presets', JSON.stringify(arr.slice(0, 12)));
+  renderPresets();
+}}
+function saveTeam(inputId) {{
+  const v = document.getElementById(inputId).value.trim();
+  if (!v) return;
+  const p = getPresets();
+  if (p.includes(v)) {{ toast('موجود مسبقاً', 'info'); return; }}
+  p.unshift(v); setPresets(p); toast('تم الحفظ', 'success');
+}}
+function removeTeam(t) {{ setPresets(getPresets().filter(x => x !== t)); }}
+function renderPresets() {{
+  const p = getPresets();
+  document.getElementById('presetTeams').innerHTML =
+    p.map(t => `<option value="${{t}}">`).join('');
+  const el = document.getElementById('blitzPresets');
+  if (!el) return;
+  if (!p.length) {{ el.innerHTML = ''; return; }}
+  el.innerHTML = p.map(t =>
+    `<span class="preset-chip" onclick="pickTeam('${{t}}')">
+      ⭐ ${{t}}<button onclick="event.stopPropagation();removeTeam('${{t}}')">×</button>
+    </span>`
+  ).join(' ');
+}}
+function pickTeam(t) {{
+  ['blitzTeam','ghostTeam','watchTeam','spamTeam'].forEach(id => {{
+    const e = document.getElementById(id);
+    if (e) e.value = t;
+  }});
+}}
+renderPresets();
+
+// ═══════════════════════════════════════════════════════════
+//  UTILS
+// ═══════════════════════════════════════════════════════════
+function toast(msg, kind) {{
+  if (window.XORE_TOAST) window.XORE_TOAST(msg, kind || 'info');
+}}
+async function copyText(t) {{
   try {{
-    const r = await fetch('/check?key={key}', {{ method: 'POST' }});
-    const data = await r.json();
-    if (!data.ok) throw new Error(data.error || 'failed');
+    await navigator.clipboard.writeText(t);
+    toast('تم النسخ: ' + t, 'success');
+  }} catch {{
+    const ta = document.createElement('textarea');
+    ta.value = t; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast('تم النسخ', 'success');
+  }}
+}}
+function esc(s) {{
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}}
+function fmtTime(ts) {{
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString('en-GB', {{hour12:false}});
+}}
+
+// ═══════════════════════════════════════════════════════════
+//  THEME / SOUND / AUTOREFRESH
+// ═══════════════════════════════════════════════════════════
+function toggleTheme() {{
+  const light = document.body.classList.toggle('light');
+  document.getElementById('themeBtn').textContent = light ? '☀️' : '🌙';
+  localStorage.setItem('xore_theme', light ? 'light' : 'dark');
+}}
+(function() {{
+  if (localStorage.getItem('xore_theme') === 'light') {{
+    document.body.classList.add('light');
+    const b = document.getElementById('themeBtn'); if (b) b.textContent = '☀️';
+  }}
+}})();
+
+function toggleSound() {{
+  window.XORE_SOUNDON = !window.XORE_SOUNDON;
+  document.getElementById('soundBtn').textContent = window.XORE_SOUNDON ? '🔔' : '🔇';
+  localStorage.setItem('xore_sound', window.XORE_SOUNDON ? '1' : '0');
+}}
+window.XORE_SOUNDON = localStorage.getItem('xore_sound') === '1';
+(function() {{
+  const b = document.getElementById('soundBtn');
+  if (b) b.textContent = window.XORE_SOUNDON ? '🔔' : '🔇';
+}})();
+
+function toggleAutoRefresh() {{
+  UI.autoRefresh = !UI.autoRefresh;
+  document.getElementById('arBtn').textContent = UI.autoRefresh ? '⏸ تلقائي' : '▶ تلقائي';
+  toast(UI.autoRefresh ? 'التحديث التلقائي مفعل' : 'التحديث التلقائي موقوف', 'info');
+}}
+
+// ═══════════════════════════════════════════════════════════
+//  INLINE ACCOUNT SUBMIT — NO PAGE RELOAD
+// ═══════════════════════════════════════════════════════════
+async function submitAccounts(mode) {{
+  const raw = document.getElementById('rawInput').value;
+  const out = document.getElementById('addResult');
+  if (!raw.trim()) {{
+    out.innerHTML = '<div class="result-box" style="border-color:var(--warn)"><div class="label" style="color:var(--warn)">⚠️ أدخل بيانات أولاً</div></div>';
+    toast('الحقل فارغ', 'warn');
+    return;
+  }}
+  const btn = mode === 'replace' ? document.getElementById('btnReplace') : document.getElementById('btnAppend');
+  const oldTxt = btn.textContent;
+  btn.disabled = true; btn.textContent = '...';
+  try {{
+    const fd = new FormData();
+    fd.append('raw', raw); fd.append('mode', mode); fd.append('key', KEY);
+    const r = await fetch('/accounts/submit', {{ method: 'POST', body: fd }});
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'فشل');
+    let extra = '';
+    if (mode === 'append') {{
+      extra = `أضيف: <strong style="color:var(--success)">${{d.added}}</strong> · متجاهل: <strong style="color:var(--warn)">${{d.skipped_dup}}</strong>`;
+    }} else {{
+      extra = `استُبدلت بـ <strong style="color:var(--success)">${{d.total}}</strong> حساب`;
+    }}
     out.innerHTML = `
-      <div class="result-box">
-        <div><div class="label">شغّالة</div><div class="big green">${{data.alive}}</div></div>
+      <div class="result-box animate-in" style="border-color:var(--success)">
+        <div><div class="label">الحالة</div>
+          <div class="big green" style="font-size:22px">✅ نجح</div></div>
         <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">معطّلة</div><div class="big red">${{data.dead}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">الإجمالي</div><div class="big purple">${{data.total}}</div></div>
-        <div style="margin-right:auto"><span class="badge success">محدّث</span></div>
+        <div><div class="label">الإجمالي الآن</div>
+          <div class="big purple">${{d.total}}</div></div>
+        <div style="margin-right:auto;color:var(--muted);font-size:13px">${{extra}}</div>
       </div>`;
+    toast(mode === 'append' ? ('أضيف ' + d.added + ' حساب') : 'استُبدل الكل', 'success');
+    document.getElementById('rawInput').value = '';
+    localStorage.removeItem('xore_draft');
+    document.getElementById('hdrTotal').textContent = d.total;
+    document.getElementById('acctCountBadge').textContent = d.total;
+    UI.page = 1;
+    reloadList();
   }} catch (e) {{
-    out.innerHTML = `<div class="result-box"><div class="label" style="color:var(--error)">خطأ: ${{e.message}}</div></div>`;
+    out.innerHTML = `<div class="result-box" style="border-color:var(--error)"><div class="label" style="color:var(--error)">❌ ${{esc(e.message)}}</div></div>`;
+    toast(e.message, 'error');
   }} finally {{
-    btn.disabled = false; btn.textContent = '▶ إعادة الفحص';
+    btn.disabled = false; btn.textContent = oldTxt;
   }}
 }}
 
-async function refreshWatch() {{
+// Draft autosave
+const rawEl = document.getElementById('rawInput');
+rawEl.value = localStorage.getItem('xore_draft') || '';
+rawEl.addEventListener('input', () => {{
+  localStorage.setItem('xore_draft', rawEl.value);
+}});
+
+// ═══════════════════════════════════════════════════════════
+//  EXPORT
+// ═══════════════════════════════════════════════════════════
+function exportAccounts(fmt) {{
+  window.location.href = '/accounts/export-json?key=' + KEY + '&fmt=' + fmt;
+}}
+
+// ═══════════════════════════════════════════════════════════
+//  ACCOUNT LIST (AJAX)
+// ═══════════════════════════════════════════════════════════
+let searchTimer = null;
+function onSearchChange() {{
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {{
+    UI.q = document.getElementById('accSearch').value.trim();
+    UI.page = 1;
+    reloadList();
+  }}, 220);
+}}
+
+function setFilter(f) {{
+  UI.filter = f; UI.page = 1;
+  document.querySelectorAll('.fchip').forEach(c => {{
+    c.classList.toggle('active', c.dataset.filter === f);
+  }});
+  reloadList();
+}}
+
+function toggleAll(chk) {{
+  if (!UI.lastList) return;
+  const items = UI.lastList.items || [];
+  items.forEach(it => {{
+    if (chk) UI.selected.add(it.uid);
+    else UI.selected.delete(it.uid);
+  }});
+  renderBatchBar();
+  renderAccountRows();
+}}
+
+function clearSelection() {{
+  UI.selected.clear();
+  renderBatchBar();
+  renderAccountRows();
+}}
+
+function toggleSelect(uid, chk) {{
+  if (chk) UI.selected.add(uid);
+  else UI.selected.delete(uid);
+  renderBatchBar();
+  const tr = document.querySelector(`tr[data-uid="${{uid}}"]`);
+  if (tr) tr.classList.toggle('selected', chk);
+}}
+
+function renderBatchBar() {{
+  const bar = document.getElementById('batchBar');
+  const c = document.getElementById('batchCount');
+  const n = UI.selected.size;
+  bar.classList.toggle('on', n > 0);
+  c.textContent = n;
+}}
+
+async function bulkOp(op) {{
+  const uids = Array.from(UI.selected);
+  if (!uids.length) return;
+  if (op === 'delete') {{
+    if (!confirm(`حذف ${{uids.length}} حساب؟ لا يمكن التراجع.`)) return;
+  }}
   try {{
-    const r = await fetch('/watch-status');
+    const r = await fetch('/accounts/bulk', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ key: KEY, op, uids }}),
+    }});
     const d = await r.json();
-    const el = document.getElementById('watchStatus');
-    if (!d.active) {{
-      el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>';
-      return;
+    if (!d.ok) throw new Error(d.error || 'فشل');
+    if (op === 'delete') toast(`حُذف ${{d.affected}} حساب`, 'success');
+    else if (op === 'enable') toast(`فُعّل ${{d.affected}} حساب`, 'success');
+    else if (op === 'disable') toast(`عُطّل ${{d.affected}} حساب`, 'warn');
+    else if (op === 'test') {{
+      toast(`اختُبر ${{d.affected}} — شغّال: ${{d.alive}} · معطّل: ${{d.dead}}`, 'info');
     }}
-    const evs = (d.events || []).slice(0, 8).map(e =>
-      `<tr><td class="mono">${{e.t}}</td><td>${{e.kind}}</td>
-       <td class="mono">${{e.uid || '-'}}</td></tr>`).join('')
-      || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">لا أحداث</td></tr>';
-    el.innerHTML = `
-      <div class="result-box">
-        <div><div class="label">الفريق</div>
-          <div class="big purple" style="font-size:22px">${{d.team||'?'}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">جلسات</div><div class="big green">${{d.sessions}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">رحّب</div><div class="big cyan">${{d.welcomed}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">مدة</div><div class="big purple">${{d.uptime||0}}s</div></div>
-      </div>
-      <table class="table" style="margin-top:14px">
-        <thead><tr><th>الوقت</th><th>الحدث</th><th>UID</th></tr></thead>
-        <tbody>${{evs}}</tbody>
-      </table>`;
-  }} catch(e) {{}}
+    UI.selected.clear();
+    renderBatchBar();
+    reloadList();
+  }} catch (e) {{
+    toast(e.message, 'error');
+  }}
 }}
 
-async function startWatch() {{
-  const team = document.getElementById('watchTeam').value.trim();
-  if (!team) return;
-  const btn = document.getElementById('watchBtn');
-  btn.disabled = true; btn.textContent = '...';
+async function reloadList() {{
   try {{
-    const r = await fetch('/watch?team=' + encodeURIComponent(team) + '&key={key}');
+    const params = new URLSearchParams({{
+      page: UI.page, page_size: UI.pageSize,
+      filter: UI.filter, sort: UI.sort, q: UI.q,
+    }});
+    const r = await fetch('/accounts/list?' + params.toString());
     const d = await r.json();
-    if (!d.ok) alert('خطأ: ' + (d.error || 'فشل'));
-  }} catch(e) {{ alert(e.message); }}
-  btn.disabled = false; btn.textContent = '👋 بدء الترحيب';
-  refreshWatch();
+    if (!d.ok) throw new Error(d.error || 'failed');
+    UI.lastList = d;
+    document.getElementById('acctCountBadge').textContent = d.total_all;
+    document.getElementById('hdrTotal').textContent = d.total_all;
+    renderAccountRows();
+    renderPager();
+    UI.selected.forEach(uid => {{
+      const tr = document.querySelector(`tr[data-uid="${{uid}}"]`);
+      if (tr) tr.classList.add('selected');
+    }});
+  }} catch (e) {{
+    document.getElementById('accBody').innerHTML =
+      `<tr><td colspan="7" style="text-align:center;color:var(--error);padding:20px">خطأ: ${{esc(e.message)}}</td></tr>`;
+  }}
 }}
 
-async function stopWatch() {{
-  await fetch('/stop-watch?key={key}');
-  refreshWatch();
+function renderAccountRows() {{
+  const d = UI.lastList;
+  if (!d) return;
+  const items = d.items || [];
+  if (!items.length) {{
+    document.getElementById('accBody').innerHTML =
+      '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:20px">لا نتائج</td></tr>';
+    return;
+  }}
+  const statusBadge = (it) => {{
+    if (!it.enabled) return '<span class="badge off">معطّل</span>';
+    if (it.last_status === 'alive') return '<span class="badge success">شغّال</span>';
+    if (it.last_status === 'dead') return '<span class="badge error">معطّل الحساب</span>';
+    return '<span class="badge info">غير مفحوص</span>';
+  }};
+  const pwDisplay = UI.reveal ? esc(it.password)
+    : `<span class="pw-hidden">${{esc(it.password)}}</span>`;
+  document.getElementById('accBody').innerHTML = items.map((it, idx) => {{
+    const num = (d.page - 1) * d.page_size + idx + 1;
+    const sel = UI.selected.has(it.uid) ? 'selected' : '';
+    const dis = it.enabled ? '' : 'disabled';
+    const meta = [];
+    if (it.alias) meta.push(`<strong>${{esc(it.alias)}}</strong>`);
+    if (it.note) meta.push(`<span style="color:var(--muted);font-size:11.5px">${{esc(it.note)}}</span>`);
+    const metaHtml = meta.join(' · ') || '<span style="color:var(--muted)">—</span>';
+    return `<tr data-uid="${{esc(it.uid)}}" class="${{dis}} ${{sel}}">
+      <td><input type="checkbox" class="chk" ${{UI.selected.has(it.uid)?'checked':''}}
+                 onchange="toggleSelect('${{esc(it.uid)}}', this.checked)"></td>
+      <td class="mono">${{num}}</td>
+      <td class="mono">${{esc(it.uid)}}</td>
+      <td>${{metaHtml}}</td>
+      <td class="mono pw-cell">${{pwDisplay}}</td>
+      <td>${{statusBadge(it)}}</td>
+      <td style="white-space:nowrap">
+        <button class="xs cyan" onclick="copyText('${{esc(it.uid)}}')" title="نسخ UID">📋 UID</button>
+        <button class="xs cyan" onclick="copyText('${{esc(it.password)}}')" title="نسخ كلمة السر">🔑 PW</button>
+        <button class="xs ${{it.enabled?'warn':'green'}}"
+                onclick="toggleAccount('${{esc(it.uid)}}')">${{it.enabled?'⏸':'▶'}}</button>
+        <button class="xs purple" style="background:linear-gradient(135deg,var(--xore-1),var(--xore-3))"
+                onclick="testOne('${{esc(it.uid)}}')">🔍</button>
+        <button class="xs gold" style="background:linear-gradient(135deg,#f5b800,#d97706);color:#1a1000"
+                onclick="editMeta('${{esc(it.uid)}}')">✏️</button>
+        <button class="xs danger" onclick="deleteAccount('${{esc(it.uid)}}')">🗑</button>
+      </td>
+    </tr>`;
+  }}).join('');
 }}
 
-async function refreshSpam() {{
+function renderPager() {{
+  const d = UI.lastList;
+  const totalPages = Math.max(1, Math.ceil(d.total_filtered / d.page_size));
+  const pager = document.getElementById('pager');
+  const info = document.getElementById('pagerInfo');
+  info.textContent = `عرض ${{d.items.length}} من ${{d.total_filtered}} (إجمالي الكل: ${{d.total_all}})`;
+  if (totalPages <= 1) {{ pager.innerHTML = ''; return; }}
+  const cur = d.page;
+  const buttons = [];
+  buttons.push(`<button class="sm gray" onclick="goPage(1)" ${{cur===1?'disabled':''}}>⏮</button>`);
+  buttons.push(`<button class="sm gray" onclick="goPage(${{cur-1}})" ${{cur===1?'disabled':''}}>◀</button>`);
+  const start = Math.max(1, cur - 3);
+  const end = Math.min(totalPages, cur + 3);
+  for (let p = start; p <= end; p++) {{
+    buttons.push(`<button class="sm ${{p===cur?'cyan':'gray'}}" onclick="goPage(${{p}})">${{p}}</button>`);
+  }}
+  buttons.push(`<button class="sm gray" onclick="goPage(${{cur+1}})" ${{cur===totalPages?'disabled':''}}>▶</button>`);
+  buttons.push(`<button class="sm gray" onclick="goPage(${{totalPages}})" ${{cur===totalPages?'disabled':''}}>⏭</button>`);
+  pager.innerHTML = buttons.join('');
+}}
+
+function goPage(p) {{ UI.page = p; reloadList(); }}
+
+function toggleRevealAll() {{
+  UI.reveal = !UI.reveal;
+  document.getElementById('revealBtn').textContent = UI.reveal ? '🙈 إخفاء' : '👁 كشف';
+  renderAccountRows();
+}}
+
+// ═══════════════════════════════════════════════════════════
+//  ACCOUNT ACTIONS
+// ═══════════════════════════════════════════════════════════
+async function toggleAccount(uid) {{
   try {{
-    const r = await fetch('/spam-status');
+    const r = await fetch('/accounts/toggle?uid=' + encodeURIComponent(uid) + '&key=' + KEY);
     const d = await r.json();
-    const el = document.getElementById('spamStatus');
-    if (!d.active) {{
-      el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>';
-      return;
+    if (d.ok) {{ toast(d.enabled ? 'مفعّل' : 'معطّل', d.enabled?'success':'warn'); reloadList(); }}
+  }} catch (e) {{ toast(e.message, 'error'); }}
+}}
+
+async function deleteAccount(uid) {{
+  if (!confirm('حذف ' + uid + '؟')) return;
+  try {{
+    const r = await fetch('/accounts/delete?uid=' + encodeURIComponent(uid) + '&key=' + KEY);
+    const d = await r.json();
+    if (d.ok) {{ toast('تم الحذف', 'success'); reloadList(); }}
+  }} catch (e) {{ toast(e.message, 'error'); }}
+}}
+
+async function testOne(uid) {{
+  toast('جاري اختبار ' + uid + '...', 'info');
+  try {{
+    const r = await fetch('/accounts/test-one?uid=' + encodeURIComponent(uid) + '&key=' + KEY,
+      {{ method: 'POST' }});
+    const d = await r.json();
+    if (d.alive) toast('✅ شغّال: ' + (d.name || uid), 'success');
+    else toast('❌ معطّل: ' + uid, 'error');
+    reloadList();
+  }} catch (e) {{ toast(e.message, 'error'); }}
+}}
+
+async function editMeta(uid) {{
+  const it = (UI.lastList.items || []).find(x => x.uid === uid);
+  if (!it) return;
+  const alias = prompt('Alias (اسم مختصر):', it.alias || '');
+  if (alias === null) return;
+  const note = prompt('ملاحظة:', it.note || '');
+  if (note === null) return;
+  try {{
+    const r = await fetch('/accounts/meta', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{ key: KEY, uid, alias, note }}),
+    }});
+    const d = await r.json();
+    if (d.ok) {{ toast('تم التحديث', 'success'); reloadList(); }}
+    else toast(d.error || 'فشل', 'error');
+  }} catch (e) {{ toast(e.message, 'error'); }}
+}}
+
+async function clearAccounts() {{
+  if (!confirm('مسح كل الحسابات؟ لا يمكن التراجع.')) return;
+  if (!confirm('تأكيد أخير — سيتم حذف الكل.')) return;
+  try {{
+    const r = await fetch('/accounts/clear?key=' + KEY);
+    const d = await r.json();
+    if (d.ok) {{
+      toast('حُذف ' + d.removed + ' حساب', 'success');
+      reloadList();
+      document.getElementById('hdrTotal').textContent = '0';
     }}
-    const evs = (d.events || []).slice(0, 8).map(e =>
-      `<tr><td class="mono">${{e.t}}</td><td>${{e.kind}}</td>
-       <td class="mono">${{e.uid || '-'}}</td></tr>`).join('')
-      || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">لا أحداث</td></tr>';
-    el.innerHTML = `
-      <div class="result-box">
-        <div><div class="label">الفريق</div>
-          <div class="big purple" style="font-size:22px">${{d.team||'?'}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">حسابات</div><div class="big cyan">${{d.accounts}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">دورات</div><div class="big green">${{d.cycles}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">JOIN</div><div class="big green">${{d.joins}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">EXIT</div><div class="big red">${{d.exits}}</div></div>
-      </div>
-      <table class="table" style="margin-top:14px">
-        <thead><tr><th>الوقت</th><th>الحدث</th><th>UID</th></tr></thead>
-        <tbody>${{evs}}</tbody>
-      </table>`;
-  }} catch(e) {{}}
+  }} catch (e) {{ toast(e.message, 'error'); }}
 }}
 
-async function refreshBlitz() {{
+// ═══════════════════════════════════════════════════════════
+//  GHOST / BLITZ / WATCH / SPAM (same as v4.2 + toasts)
+// ═══════════════════════════════════════════════════════════
+async function startGhost() {{
+  const team = document.getElementById('ghostTeam').value.trim();
+  if (!team) return toast('أدخل كود الفريق', 'warn');
+  const btn = document.getElementById('ghostBtn');
+  const out = document.getElementById('ghostResult');
+  btn.disabled = true; btn.innerHTML = '...<span class="spinner"></span>';
+  out.innerHTML = '<div class="result-box"><div class="label">⏳ يشتغل...</div></div>';
   try {{
-    const r = await fetch('/blitz-status');
-    const d = await r.json();
-    const el = document.getElementById('blitzStatus');
-    if (!d.active) {{
-      el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>';
-      return;
-    }}
-    const pct = d.total ? Math.floor((d.joined / d.total) * 100) : 0;
-    const evs = (d.events || []).slice(0, 12).map(e =>
-      `<tr><td class="mono">${{e.t}}</td><td>${{e.kind}}</td>
-       <td class="mono">${{e.uid || '-'}}</td></tr>`).join('')
-      || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">لا أحداث بعد...</td></tr>';
-    el.innerHTML = `
-      <div class="result-box">
-        <div><div class="label">دخلوا</div><div class="big green">${{d.joined}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">رحّبوا</div><div class="big gold">${{d.welcomed}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">خرجوا</div><div class="big red">${{d.exited}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">أخطاء</div><div class="big red" style="font-size:22px">${{d.errors}}</div></div>
-      </div>
-      <div class="progress-outer" style="margin-top:14px">
-        <div class="progress-inner" style="width:${{pct}}%"></div>
-      </div>
-      <div style="text-align:center;margin-top:8px;font-size:12px;color:var(--muted);font-weight:700">
-        ${{d.joined}}/${{d.total}} — ${{pct}}%
-      </div>
-      <table class="table" style="margin-top:14px">
-        <thead><tr><th>الوقت</th><th>الحدث</th><th>UID</th></tr></thead>
-        <tbody>${{evs}}</tbody>
-      </table>`;
-  }} catch(e) {{}}
-}}
-
-async function startSpam() {{
-  const team = document.getElementById('spamTeam').value.trim();
-  const rate = document.getElementById('spamRate').value.trim() || '0.15';
-  const dur = document.getElementById('spamDuration').value.trim() || '120';
-  const accs = document.getElementById('spamAccounts').value.trim() || '30';
-  if (!team) return;
-  const btn = document.getElementById('spamBtn');
-  btn.disabled = true; btn.textContent = '...';
-  try {{
-    const url = `/spam?team=${{encodeURIComponent(team)}}&rate=${{rate}}`
-      + `&duration=${{dur}}&accounts=${{accs}}&key={key}`;
-    const r = await fetch(url);
-    const d = await r.json();
-    if (!d.ok) alert('خطأ: ' + (d.error || 'فشل'));
-  }} catch(e) {{ alert(e.message); }}
-  btn.disabled = false; btn.textContent = '💥 بدء السبام';
-  refreshSpam();
-}}
-
-async function stopSpam() {{
-  await fetch('/stop-spam?key={key}');
-  refreshSpam();
-}}
-
-async function startBlitz() {{
-  const team = document.getElementById('blitzTeam').value.trim();
-  const cnt = document.getElementById('blitzCount').value.trim() || '{BLITZ_ACCOUNTS_MAX}';
-  const lng = document.getElementById('blitzLinger').value.trim() || '{BLITZ_LINGER_S}';
-  const msg = document.getElementById('blitzMsg').value.trim() || '{WELCOME_MSG}';
-  if (!team) return;
-  const btn = document.getElementById('blitzBtn');
-  btn.disabled = true; btn.textContent = '...';
-  try {{
-    const url = `/blitz?team=${{encodeURIComponent(team)}}`
-      + `&accounts=${{cnt}}&linger=${{lng}}`
-      + `&msg=${{encodeURIComponent(msg)}}&key={key}`;
-    const r = await fetch(url);
-    const d = await r.json();
-    if (!d.ok) alert('خطأ: ' + (d.error || 'فشل'));
-  }} catch(e) {{ alert(e.message); }}
-  btn.disabled = false; btn.textContent = '🌍 ابدأ الانفجار العالمي';
-  refreshBlitz();
-}}
-
-async function stopBlitz() {{
-  await fetch('/stop-blitz?key={key}');
-  refreshBlitz();
-}}
-
-setInterval(refreshWatch, 3000);
-setInterval(refreshSpam, 2500);
-setInterval(refreshBlitz, 1500);
-refreshWatch(); refreshSpam(); refreshBlitz();
-</script>
-"""
-    return _wrap("Admin", body)
-
-
-# ═══════════════════════════════════════════════════════════
-#  🚀  FASTAPI APP
-# ═══════════════════════════════════════════════════════════
-
-app = FastAPI(title="XORE FF Bot", version="4.1.0")
-
-
-@app.get("/", response_class=HTMLResponse)
-def root(key: str = Query("")):
-    if key and is_admin(key):
-        return render_admin(key)
-    return render_public()
-
-
-@app.get("/health")
-def health():
-    ws = _watch_snapshot(); sp = _spam_snapshot(); bz = _blitz_snapshot()
-    return {
-        "ok": True, "version": "4.1.0",
-        "hb_per_account": HB_PER_ACCOUNT,
-        "max_session_seconds": MAX_SESSION_SECONDS,
-        "welcome_enabled": WELCOME_ENABLED,
-        "welcome_msg": WELCOME_MSG,
-        "welcome_channel": WELCOME_CHANNEL,
-        "watch_active": ws["active"], "watch_team": ws["team"],
-        "spam_active": sp["active"], "spam_team": sp["team"],
-        "blitz_active": bz["active"], "blitz_team": bz["team"],
-        "speed_multiplier": 6,
-    }
-
-
-@app.post("/check")
-def check_live(key: str = Query("")):
-    if not is_admin(key):
-        return JSONResponse(status_code=403,
-                            content={"ok": False, "error": "invalid key"})
-    accounts = get_accounts()
-    if not accounts:
-        return {"ok": False, "error": "no accounts"}
-    _set_live_status(checking=True, checked=False,
-                     total=len(accounts), started_at=time.time())
-    results = []
-    with ThreadPoolExecutor(max_workers=min(len(accounts), LOGIN_POOL)) as pool:
-        futures = {pool.submit(login_account, u, p): u for u, p in accounts}
-        for f in as_completed(futures, timeout=90):
-            uid = futures[f]
-            try:
-                r = f.result(timeout=LOGIN_TIMEOUT + 4)
-            except Exception:
-                r = None
-            results.append({"uid": uid, "ok": r is not None,
-                            "name": r["name"] if r else None,
-                            "error": None if r else "login failed"})
-    alive = sum(1 for r in results if r["ok"])
-    dead = len(results) - alive
-    _set_live_status(checking=False, checked=True,
-                     total=len(results), alive=alive, dead=dead,
-                     results=results, finished_at=time.time())
-    return {"ok": True, "total": len(results), "alive": alive,
-            "dead": dead, "results": results}
-
-
-@app.get("/start")
-def start_bot(
-    team: str = Query(..., min_length=1, max_length=20),
-    key: str = Query(""),
-    format: str = Query("json"),
-):
-    if not team.strip():
-        raise HTTPException(400, "Team code required")
-    start_time = time.time()
-    deadline = start_time + MAX_SESSION_SECONDS
-    accounts = get_accounts()
-    if not accounts:
-        return JSONResponse(status_code=400, content={
-            "status": "failed", "reason": "no accounts",
-            "team": team, "results": [],
-        })
-    sessions = []; login_errors = []
-    with ThreadPoolExecutor(max_workers=min(len(accounts), LOGIN_POOL)) as pool:
-        futures = {uid: pool.submit(login_account, uid, pw)
-                   for uid, pw in accounts}
-        for uid, f in futures.items():
-            try:
-                r = f.result(timeout=LOGIN_TIMEOUT)
-            except Exception as e:
-                r = None
-                login_errors.append({"uid": uid, "error": str(e)})
-            if r:
-                sessions.append(r)
-            else:
-                login_errors.append({"uid": uid, "error": "login failed"})
-    if not sessions:
-        return JSONResponse(status_code=502, content={
-            "status": "failed", "reason": "no sessions",
-            "team": team, "elapsed": round(time.time() - start_time, 2),
-            "login_errors": login_errors, "results": [],
-            "accounts_logged": 0, "accounts_ran": 0,
-            "hb_per_account": HB_PER_ACCOUNT,
-        })
-    barrier = threading.Barrier(len(sessions) * HB_PER_ACCOUNT)
-    results = []; threads = []
-    for s in sessions:
-        t = threading.Thread(
-            target=lambda sd=s: results.extend(
-                run_one_account(sd, team, barrier, deadline)),
-            daemon=True)
-        threads.append(t); t.start()
-    for t in threads:
-        t.join(timeout=max(0.1, deadline - time.time()))
-    by_account = {}
-    for r in results:
-        uid = str(r.get("uid"))
-        e = by_account.setdefault(uid, {
-            "uid": uid, "chat": None, "online": None,
-            "chat2": None, "online2": None,
-            "total_sent": 0, "errors": []})
-        tag = r["tag"]
-        if   tag == "ChaT":    e["chat"]    = r["status"]
-        elif tag == "OnLinE":  e["online"]  = r["status"]
-        elif tag == "ChaT2":   e["chat2"]   = r["status"]
-        elif tag == "OnLinE2": e["online2"] = r["status"]
-        e["total_sent"] += r.get("sent", 0)
-        if r.get("error"): e["errors"].append(f"{tag}: {r['error']}")
-    return {
-        "status": "completed", "team": team,
-        "elapsed": round(time.time() - start_time, 2),
-        "accounts_logged": len(sessions),
-        "accounts_ran": len(by_account),
-        "hb_per_account": HB_PER_ACCOUNT,
-        "login_errors": login_errors,
-        "results": list(by_account.values()),
-    }
-
-
-@app.get("/watch")
-def watch_bot(
-    team: str = Query(..., min_length=1, max_length=20),
-    key: str = Query(""),
-    duration: int = Query(0),
-):
-    if not team.strip():
-        raise HTTPException(400, "Team code required")
-    if not is_admin(key):
-        return JSONResponse(status_code=403,
-                            content={"ok": False, "error": "invalid key"})
-    snap = _watch_snapshot()
-    if snap["active"]:
-        return JSONResponse(status_code=409, content={
-            "ok": False, "error": "watch already active",
-            "team": snap["team"], "sessions": snap["sessions"],
-        })
-    global _WATCH_STOP_EVENTS
-    stop_event = threading.Event()
-    _WATCH_STOP_EVENTS.append(stop_event)
-    accounts = get_accounts()
-    if not accounts:
-        return JSONResponse(status_code=400,
-                            content={"ok": False, "error": "no accounts"})
-    sessions_data = []; login_errors = []
-    with ThreadPoolExecutor(max_workers=min(len(accounts), LOGIN_POOL)) as pool:
-        futures = {uid: pool.submit(login_account, uid, pw)
-                   for uid, pw in accounts}
-        for uid, f in futures.items():
-            try:
-                r = f.result(timeout=LOGIN_TIMEOUT)
-            except Exception as e:
-                r = None
-                login_errors.append({"uid": uid, "error": str(e)})
-            if r: sessions_data.append(r)
-            else: login_errors.append({"uid": uid, "error": "login failed"})
-    if not sessions_data:
-        return JSONResponse(status_code=502, content={
-            "ok": False, "error": "no sessions",
-            "login_errors": login_errors,
-        })
-    barrier = threading.Barrier(len(sessions_data))
-
-    def _watch_worker(sd):
-        ws = {
-            "stop": stop_event,
-            "lock": threading.Lock(),
-            "known": {int(sd["uid"])},
-            "baseline_done": False,
-            "started": time.time(),
-        }
-        try:
-            run_one_account(sd, team, barrier, time.time() + 60, ws)
-        except Exception:
-            pass
-
-    for sd in sessions_data:
-        threading.Thread(target=_watch_worker, args=(sd,),
-                         daemon=True).start()
-
-    with _WATCH_LOCK:
-        _WATCH_STATE["active"] = True
-        _WATCH_STATE["team"] = team
-        _WATCH_STATE["started_at"] = time.time()
-        _WATCH_STATE["sessions"] = len(sessions_data)
-        _WATCH_STATE["welcomed"] = 0
-        _WATCH_STATE["events"] = []
-
-    if duration > 0:
-        def _auto_stop():
-            time.sleep(duration)
-            stop_event.set()
-            with _WATCH_LOCK:
-                _WATCH_STATE["active"] = False
-        threading.Thread(target=_auto_stop, daemon=True).start()
-
-    return {
-        "ok": True, "team": team,
-        "sessions": len(sessions_data),
-        "login_errors": login_errors,
-        "welcome_msg": WELCOME_MSG,
-        "keepalive_s": WATCH_KEEPALIVE,
-        "duration_s": duration or WATCH_KEEPALIVE,
-    }
-
-
-@app.get("/stop-watch")
-def stop_watch(key: str = Query("")):
-    if not is_admin(key):
-        return JSONResponse(status_code=403,
-                            content={"ok": False, "error": "invalid key"})
-    global _WATCH_STOP_EVENTS
-    with _WATCH_LOCK:
-        n = len(_WATCH_STOP_EVENTS)
-        for ev in _WATCH_STOP_EVENTS:
-            ev.set()
-        _WATCH_STOP_EVENTS.clear()
-        _WATCH_STATE["active"] = False
-    return {"ok": True, "stopped": n}
-
-
-@app.get("/watch-status")
-def watch_status():
-    snap = _watch_snapshot()
-    if snap["active"]:
-        snap["uptime"] = round(time.time() - snap["started_at"], 1)
-    return {"ok": True, **snap, "welcome_msg": WELCOME_MSG}
-
-
-@app.get("/spam")
-def spam_bot(
-    team: str = Query(..., min_length=1, max_length=20),
-    key: str = Query(""),
-    rate: float = Query(SPAM_RATE),
-    duration: int = Query(SPAM_DURATION),
-    accounts: int = Query(20),
-):
-    if not team.strip():
-        raise HTTPException(400, "Team code required")
-    if not is_admin(key):
-        return JSONResponse(status_code=403,
-                            content={"ok": False, "error": "invalid key"})
-    snap = _spam_snapshot()
-    if snap["active"]:
-        return JSONResponse(status_code=409, content={
-            "ok": False, "error": "spam already active",
-            "team": snap["team"],
-        })
-
-    rate = max(0.02, min(rate, 5.0))
-    duration = max(5, min(duration, 1800))
-    accounts = max(1, min(accounts, SPAM_ACCOUNTS_MAX))
-
-    all_accs = get_accounts()
-    if not all_accs:
-        return JSONResponse(status_code=400,
-                            content={"ok": False, "error": "no accounts"})
-    sel = all_accs[:accounts]
-
-    sessions_data = []; login_errors = []
-    with ThreadPoolExecutor(max_workers=min(len(sel), LOGIN_POOL)) as pool:
-        futures = {uid: pool.submit(login_account, uid, pw)
-                   for uid, pw in sel}
-        for uid, f in futures.items():
-            try:
-                r = f.result(timeout=LOGIN_TIMEOUT)
-            except Exception as e:
-                r = None
-                login_errors.append({"uid": uid, "error": str(e)})
-            if r: sessions_data.append(r)
-            else: login_errors.append({"uid": uid, "error": "login failed"})
-
-    if not sessions_data:
-        return JSONResponse(status_code=502, content={
-            "ok": False, "error": "no sessions",
-            "login_errors": login_errors,
-        })
-
-    global _SPAM_STOP_EVENTS
-    stop_event = threading.Event()
-    _SPAM_STOP_EVENTS.append(stop_event)
-
-    def _spam_worker(sd):
-        try:
-            _SpamCycle(sd, team, stop_event, rate, duration)
-        except Exception:
-            _spam_push("error", sd["uid"])
-
-    for sd in sessions_data:
-        threading.Thread(target=_spam_worker, args=(sd,),
-                         daemon=True).start()
-
-    with _SPAM_LOCK:
-        _SPAM_STATE["active"] = True
-        _SPAM_STATE["team"] = team
-        _SPAM_STATE["started_at"] = time.time()
-        _SPAM_STATE["accounts"] = len(sessions_data)
-        _SPAM_STATE["cycles"] = 0
-        _SPAM_STATE["joins"] = 0
-        _SPAM_STATE["exits"] = 0
-        _SPAM_STATE["errors"] = 0
-        _SPAM_STATE["events"] = []
-
-    def _auto_stop():
-        time.sleep(duration + 2)
-        stop_event.set()
-        with _SPAM_LOCK:
-            _SPAM_STATE["active"] = False
-    threading.Thread(target=_auto_stop, daemon=True).start()
-
-    return {
-        "ok": True, "team": team,
-        "accounts": len(sessions_data),
-        "rate_s": rate, "duration_s": duration,
-        "login_errors": login_errors,
-    }
-
-
-@app.get("/stop-spam")
-def stop_spam(key: str = Query("")):
-    if not is_admin(key):
-        return JSONResponse(status_code=403,
-                            content={"ok": False, "error": "invalid key"})
-    global _SPAM_STOP_EVENTS
-    with _SPAM_LOCK:
-        n = len(_SPAM_STOP_EVENTS)
-        for ev in _SPAM_STOP_EVENTS:
-            ev.set()
-        _SPAM_STOP_EVENTS.clear()
-        _SPAM_STATE["active"] = False
-    return {"ok": True, "stopped": n}
-
-
-@app.get("/spam-status")
-def spam_status():
-    snap = _spam_snapshot()
-    if snap["active"]:
-        snap["uptime"] = round(time.time() - snap["started_at"], 1)
-    return {"ok": True, **snap}
-
-
-# ═══════════════════════════════════════════════════════════
-#  🌍  GLOBAL BLITZ ENDPOINTS
-# ═══════════════════════════════════════════════════════════
-
-@app.get("/blitz")
-def blitz_bot(
-    team: str = Query(..., min_length=1, max_length=20),
-    key: str = Query(""),
-    accounts: int = Query(BLITZ_ACCOUNTS_MAX),
-    linger: float = Query(BLITZ_LINGER_S),
-    msg: str = Query(WELCOME_MSG),
-):
-    if not team.strip():
-        raise HTTPException(400, "Team code required")
-    if not is_admin(key):
-        return JSONResponse(status_code=403,
-                            content={"ok": False, "error": "invalid key"})
-    snap = _blitz_snapshot()
-    if snap["active"]:
-        return JSONResponse(status_code=409, content={
-            "ok": False, "error": "blitz already active",
-            "team": snap["team"],
-        })
-
-    accounts = max(10, min(int(accounts), BLITZ_ACCOUNTS_MAX, MAX_ACCOUNTS))
-    linger   = max(0.5, min(float(linger), 30.0))
-    msg      = (msg or WELCOME_MSG)[:120]
-
-    all_accs = get_accounts()
-    if not all_accs:
-        return JSONResponse(status_code=400,
-                            content={"ok": False, "error": "no accounts"})
-    sel = all_accs[:accounts]
-    random.shuffle(sel)
-
-    login_errors = []
-    sessions_data = []
-    with ThreadPoolExecutor(max_workers=min(len(sel), LOGIN_POOL)) as pool:
-        futures = {uid: pool.submit(login_account, uid, pw)
-                   for uid, pw in sel}
-        for uid, f in futures.items():
-            try:
-                r = f.result(timeout=LOGIN_TIMEOUT)
-            except Exception as e:
-                r = None
-                login_errors.append({"uid": uid, "error": str(e)})
-            if r: sessions_data.append(r)
-            else: login_errors.append({"uid": uid, "error": "login failed"})
-
-    if not sessions_data:
-        return JSONResponse(status_code=502, content={
-            "ok": False, "error": "no sessions",
-            "login_errors": login_errors,
-        })
-
-    global _BLITZ_STOP_EVENTS
-    stop_event = threading.Event()
-    _BLITZ_STOP_EVENTS.append(stop_event)
-
-    with _BLITZ_LOCK:
-        _BLITZ_STATE["active"] = True
-        _BLITZ_STATE["team"] = team
-        _BLITZ_STATE["started_at"] = time.time()
-        _BLITZ_STATE["accounts"] = len(sessions_data)
-        _BLITZ_STATE["joined"] = 0
-        _BLITZ_STATE["welcomed"] = 0
-        _BLITZ_STATE["exited"] = 0
-        _BLITZ_STATE["errors"] = 0
-        _BLITZ_STATE["events"] = []
-        _BLITZ_STATE["total"] = len(sessions_data)
-
-    def _worker(sd):
-        try:
-            _BlitzWorker(sd, team, stop_event, linger, msg)
-        except Exception:
-            _blitz_push("error", sd["uid"])
-
-    for sd in sessions_data:
-        threading.Thread(target=_worker, args=(sd,), daemon=True).start()
-
-    def _auto_finalize():
-        time.sleep(linger + 30)
-        with _BLITZ_LOCK:
-            _BLITZ_STATE["active"] = False
-    threading.Thread(target=_auto_finalize, daemon=True).start()
-
-    return {
-        "ok": True, "team": team,
-        "accounts": len(sessions_data),
-        "linger_s": linger,
-        "channel": BLITZ_CHANNEL,
-        "login_errors": login_errors,
-        "msg": msg,
-    }
-
-
-@app.get("/stop-blitz")
-def stop_blitz(key: str = Query("")):
-    if not is_admin(key):
-        return JSONResponse(status_code=403,
-                            content={"ok": False, "error": "invalid key"})
-    global _BLITZ_STOP_EVENTS
-    with _BLITZ_LOCK:
-        n = len(_BLITZ_STOP_EVENTS)
-        for ev in _BLITZ_STOP_EVENTS:
-            ev.set()
-        _BLITZ_STOP_EVENTS.clear()
-        _BLITZ_STATE["active"] = False
-    return {"ok": True, "stopped": n}
-
-
-@app.get("/blitz-status")
-def blitz_status():
-    snap = _blitz_snapshot()
-    if snap["active"]:
-        snap["uptime"] = round(time.time() - snap["started_at"], 1)
-    return {"ok": True, **snap}
-
-
-@app.post("/replace")
-async def replace_endpoint(request: Request):
-    form = await request.form()
-    raw = form.get("raw", "") or ""
-    mode = form.get("mode", "replace")
-    key = form.get("key", "") or ""
-    if not is_admin(key):
-        return HTMLResponse(_wrap("Error", """
-            <div class="card"><h2 style="color:var(--error)">❌ مفتاح غير صحيح</h2>
-            <a href="/" class="btn">← الرجوع</a></div>"""), status_code=403)
-    if not raw.strip():
-        return HTMLResponse(_wrap("Error", f"""
-            <div class="card"><h2 style="color:var(--error)">❌ لا يوجد بيانات</h2>
-            <a href="/?key={key}" class="btn">← الرجوع</a></div>"""))
-    if mode == "append":
-        added = add_accounts(raw)
-        msg = f"تمت إضافة {added} حساب"
-    else:
-        n = replace_accounts(raw)
-        msg = f"تم استبدال الحسابات — الإجمالي {n} حساب"
-    return HTMLResponse(_wrap("Done", f"""
-        <div class="header">
-          <div class="logo" style="font-size:34px;letter-spacing:8px">DONE</div>
-        </div>
-        <div class="card">
-          <h2>✅ نجح</h2>
-          <p style="font-size:16px;margin-bottom:20px">{msg}</p>
-          <div class="stats">
-            <div class="stat"><div class="label">الإجمالي الآن</div>
-              <div class="value purple">{len(get_accounts())}</div></div>
-          </div>
-          <div style="margin-top:20px">
-            <a href="/?key={key}" class="btn">← الرجوع للوحة</a>
-          </div>
-        </div>"""))
-
-
-@app.get("/api/status")
-def api_status():
-    live = get_live_status(); ws = _watch_snapshot()
-    sp = _spam_snapshot(); bz = _blitz_snapshot()
-    return {
-        "status": "ok", "version": "4.1.0",
-        "accounts": len(get_accounts()),
-        "max_accounts": MAX_ACCOUNTS,
-        "hb_per_account": HB_PER_ACCOUNT,
-        "max_session_seconds": MAX_SESSION_SECONDS,
-        "alive": live["alive"] if live["checked"] else None,
-        "dead": live["dead"] if live["checked"] else None,
-        "watch_active": ws["active"],
-        "spam_active": sp["active"],
-        "blitz_active": bz["active"],
-        "release": "OB55", "region": "ME",
-        "speed_multiplier": 6,
-    }
-
-
-# ═══════════════════════════════════════════════════════════
-#  🏁  ENTRY
-# ═══════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", "8000"))
-    _log(f"XORE v4.1 starting port {port}, "
-         f"HB={HB_PER_ACCOUNT}, pool={LOGIN_POOL}, "
-         f"blitz_max={BLITZ_ACCOUNTS_MAX}, linger={BLITZ_LINGER_S}s")
-    uvicorn.run(app, host="0.0.0.0", port=port,
-                log_level="info", access_log=False)
+    const r = await fetch('/
