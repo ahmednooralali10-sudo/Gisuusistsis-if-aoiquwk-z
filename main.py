@@ -1,27 +1,41 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-XORE FF BOT
-===========
+XORE FF BOT — v3.2 (4-HB parallel per account, single-file)
+============================================================
 Public landing + Admin dashboard (key-protected) with AJAX.
 
 Routes:
-    GET  /                       → landing (بسيط — AJAX)
-    GET  /?key=<ADMIN_KEY>       → dashboard كامل
+    GET  /                       → landing (AJAX)
+    GET  /?key=<ADMIN_KEY>       → dashboard
     POST /check?key=<KEY>        → فحص حي (admin)
-    GET  /start?team=<code>      → تشغيل (يرجع JSON دائماً)
+    GET  /start?team=<code>      → تشغيل (JSON دائماً)
     POST /replace                → إدارة حسابات (admin)
     GET  /api/status             → حالة
+    GET  /health                 → فحص الصحة
+
+Speed profile (v3.2):
+    MAX_SESSION_SECONDS = 22   (كان 50)
+    LOGIN_TIMEOUT       = 8    (كان 15)
+    TCP_CONNECT_TIMEOUT = 6    (كان 15)
+    POST_LOGIN_WAIT     = 0.15 (كان 0.3)
+    read loop           = 5s   (كان 15s)
+    HB per account      = 4    (كان 2)
+    ThreadPool          = 32   (كان 15)
+    TCP_NODELAY + SO_LINGER RST + 256KB buffer
 """
 import json
 import os
 import random
 import socket
+import struct
 import threading
 import time
 import urllib3
 
 import requests
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
+from Crypto.Util.Padding import pad
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,11 +56,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 xK = b"Yg&tc%DEuh6%Zc^8"
 xV = b"6oyZDr22E3ychjM%"
 
-MAX_SESSION_SECONDS = 50
-MAX_ACCOUNTS = 500
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "mahdixorepy12340")
+MAX_SESSION_SECONDS = int(os.environ.get("MAX_SESSION_SECONDS", "22"))
+HB_PER_ACCOUNT      = int(os.environ.get("HB_PER_ACCOUNT", "4"))
+MAX_ACCOUNTS        = int(os.environ.get("MAX_ACCOUNTS", "500"))
+ADMIN_KEY           = os.environ.get("ADMIN_KEY", "mahdixorepy12340")
+LOGIN_TIMEOUT       = int(os.environ.get("LOGIN_TIMEOUT", "8"))
+TCP_CONNECT_TIMEOUT = int(os.environ.get("TCP_CONNECT_TIMEOUT", "6"))
+POST_LOGIN_WAIT     = float(os.environ.get("POST_LOGIN_WAIT", "0.15"))
+LOGIN_POOL          = int(os.environ.get("LOGIN_POOL", "32"))
 
-_DEFAULT_ACCOUNTS_RAW = """
+_DEFAULT_ACCOUNTS_RAW = os.environ.get("FF_ACCOUNTS_RAW", "") or """
 S7L8QUXNKDY8-S1X_TEAM:4555612051
 S7LFDZ8ZEEMF-S1X_TEAM:4555612941
 S7LYRBXKENCE-S1X_TEAM:4555613802
@@ -57,246 +76,13 @@ S7LHR6RDFK17-S1X_TEAM:4555614870
 S7LXPOMEKAEI-S1X_TEAM:4555614971
 S7LJ2WHEYG3P-S1X_TEAM:4555615013
 S7LUP4A85QZR-S1X_TEAM:4555625755
-S7LYQLRHGKY8-S1X_TEAM:4555625950
-S7LEQABTL51X-S1X_TEAM:4555626124
-S7LCHCUI22IQ-S1X_TEAM:4555626284
-S7LGUYGC5Z5H-S1X_TEAM:4555626414
-S7LG79GTDB4A-S1X_TEAM:4555626580
-S7LR8I2JSA3B-S1X_TEAM:4555626858
-S7LSOD3DWSDH-S1X_TEAM:4555626925
-S7L2R4WFRI5K-S1X_TEAM:4555626978
-S7LGIIOKVQXD-S1X_TEAM:4555629318
-S7LROQKCQWWW-S1X_TEAM:4555629643
-S7LT5555B7VZ-S1X_TEAM:4555629698
-S7L432EGSDTQ-S1X_TEAM:4555629769
-S7L8VMQJFCAY-S1X_TEAM:4555629853
-S7LRNC59NLFO-S1X_TEAM:4555630041
-S7LDO092IQHZ-S1X_TEAM:4555630092
-S7LIBUAQMKIF-S1X_TEAM:4555630883
-S7LS6V9T1BOP-S1X_TEAM:4555631918
-S7LKFJ8EWQTE-S1X_TEAM:4555632289
-S7LRPTVFY61P-S1X_TEAM:4555632916
-S7LWOJ68GAHY-S1X_TEAM:4555633110
-S7LBPLQSWOIE-S1X_TEAM:4555633862
-S7LDKJEZ6I12-S1X_TEAM:4555719862
-S7LLLYSK70YR-S1X_TEAM:4555720054
-S7LBW8CPZYGK-S1X_TEAM:4555720196
-S7LXBIREJV4Z-S1X_TEAM:4555720320
-S7LSBIQKNRWB-S1X_TEAM:4555720526
-S7LXN1W9JZYC-S1X_TEAM:4555720745
-S7L4TR5HF11C-S1X_TEAM:4555720853
-S7LPAHS9NU82-S1X_TEAM:4556615537
-S7LVFV4GPKRB-S1X_TEAM:4556615620
-S7LHXQXDKFMG-S1X_TEAM:4556615700
-S7LRB1WFIPQC-S1X_TEAM:4556615992
-S7LJFPJVDZHZ-S1X_TEAM:4556616059
-S7LRTTSMMWJA-S1X_TEAM:4556616132
-S7LYKHVUMTBG-S1X_TEAM:4556616203
-S7L5ECXOVAVD-S1X_TEAM:4556616278
-S7LUHFJEQXAK-S1X_TEAM:4556616363
-S7LIASVXGD6V-S1X_TEAM:4556616453
-S7LJ8Y0A026N-S1X_TEAM:4556616638
-S7LU478JQBY3-S1X_TEAM:4556616730
-S7LUQCTE5EGO-S1X_TEAM:4556616834
-S7LENS9OZTMY-S1X_TEAM:4556616957
-S7LLFQRRJVXC-S1X_TEAM:4556617098
-S7LF936MSJXR-S1X_TEAM:4556617214
-S7LGGVVKN7KJ-S1X_TEAM:4556617302
-S7LVXYZP4KKK-S1X_TEAM:4556617415
-S7LOOJ2OSS0N-S1X_TEAM:4556617491
-S7LFEPHKOOD5-S1X_TEAM:4556617569
-S7LLI53DJS4H-S1X_TEAM:4556617663
-S7LWHKTK4AT4-S1X_TEAM:4556617747
-S7L0BQW2SU0X-S1X_TEAM:4556617848
-S7L53PSOYW1S-S1X_TEAM:4556617917
-S7LXNL4QNUNH-S1X_TEAM:4556617982
-S7LTY54YUAZ2-S1X_TEAM:4556618108
-S7LO0TWRMC0B-S1X_TEAM:4556618270
-S7L1AT8VV05L-S1X_TEAM:4556618530
-S7LKGDYQQCNY-S1X_TEAM:4556618619
-S7LS67JTBCEG-S1X_TEAM:4556618696
-S7L3LCD0JRLO-S1X_TEAM:4556618793
-S7LDD1LYABUS-S1X_TEAM:4556618873
-S7L1THS8JL0A-S1X_TEAM:4556619046
-S7LD5EXTUVEB-S1X_TEAM:4556619227
-S7LJOK6FG2G4-S1X_TEAM:4556619521
-S7L4IPW7VPIK-S1X_TEAM:4556619713
-S7LNUQTQIHXB-S1X_TEAM:4556619886
-S7LDEC8IZ2ZN-S1X_TEAM:4556620078
-S7LU4ANGICCC-S1X_TEAM:4556620242
-S7LJXJHO7GAL-S1X_TEAM:4556620339
-S7LZWJHDP87N-S1X_TEAM:4556620465
-S7LVE0SNULN7-S1X_TEAM:4556620628
-S7LMYZX5T8PN-S1X_TEAM:4556620827
-S7LSTGT0W2FC-S1X_TEAM:4556620938
-S7LER1NO1DZV-S1X_TEAM:4556621023
-S7LDEVR90TK0-S1X_TEAM:4556621217
-S7LG16WVVPEX-S1X_TEAM:4556621305
-S7L2LLJ7CDXN-S1X_TEAM:4556621393
-S7LBZVOMQGLD-S1X_TEAM:4556621575
-S7LVDMQ0W4XT-S1X_TEAM:4556621858
-S7LSA7RCOQWX-S1X_TEAM:4556622080
-S7LMJVS3RPX4-S1X_TEAM:4556622274
-S7LDFONYFONV-S1X_TEAM:4556622373
-S7LPEWRHCHID-S1X_TEAM:4556622464
-S7LDSTSZIZB5-S1X_TEAM:4556622534
-S7LERBB1QC5T-S1X_TEAM:4556622607
-S7LFLVZPYEQX-S1X_TEAM:4556622688
-S7LYEB7QD2GO-S1X_TEAM:4556622781
-S7LKQRN2ASL4-S1X_TEAM:4556623075
-S7LREQHLGKZN-S1X_TEAM:4556623267
-S7LJOTP8NIZE-S1X_TEAM:4556623375
-S7LBNZEXOL9L-S1X_TEAM:4556623467
-S7LJCVP53Y8C-S1X_TEAM:4556623543
-S7LM7ZFSFWCZ-S1X_TEAM:4556623639
-S7LJOHHYPRIR-S1X_TEAM:4556623766
-S7LQH3OEUPI7-S1X_TEAM:4556623883
-S7LUVHAWLI7L-S1X_TEAM:4556623992
-S7LNEY4SHV5K-S1X_TEAM:4556624135
-S7LDAFUL4AXK-S1X_TEAM:4556624258
-S7L9OR6KCB8G-S1X_TEAM:4556624361
-S7LPU0LPV3LN-S1X_TEAM:4556624483
-S7LD6YX3ZGQN-S1X_TEAM:4556624586
-S7LB8UNTTEDQ-S1X_TEAM:4556624695
-S7L0CUUX310F-S1X_TEAM:4556624760
-S7LDHUW3FEIZ-S1X_TEAM:4556624854
-S7LPRSIK5SNW-S1X_TEAM:4556624928
-S7LP6DISUSET-S1X_TEAM:4556625007
-S7LFERTAKWWC-S1X_TEAM:4556625120
-S7LF6PG8Q3OL-S1X_TEAM:4556625278
-S7LSZO5WOFEI-S1X_TEAM:4556625414
-S7LIZL4WS0G5-S1X_TEAM:4556625511
-S7L3TYQ00EYL-S1X_TEAM:4556625607
-S7LFCQY6WN1H-S1X_TEAM:4556625685
-S7LL51LU2MEG-S1X_TEAM:4556625781
-S7LS5GCNZC9L-S1X_TEAM:4556625895
-S7LEFGEFO4NF-S1X_TEAM:4556625979
-S7L2GDZSOBDE-S1X_TEAM:4556626058
-S7LRLU7QFRUR-S1X_TEAM:4556626144
-S7LO2C3FZMYK-S1X_TEAM:4556626243
-S7LSR5DAVVHE-S1X_TEAM:4556626368
-S7LCOBPUKZWZ-S1X_TEAM:4556626471
-S7LJAKS7YQUV-S1X_TEAM:4556626630
-S7LCFSKN3DMJ-S1X_TEAM:4556626750
-S7LX7S8FD44K-S1X_TEAM:4556626871
-S7LIPJ5KBKRC-S1X_TEAM:4556626959
-S7L9RZYLFZHE-S1X_TEAM:4556627058
-S7LTCZK6RWCW-S1X_TEAM:4556627131
-S7LSHZT3Y4A1-S1X_TEAM:4556627218
-S7LR4ORUMAI5-S1X_TEAM:4556627294
-S7LEJ1RI0NA6-S1X_TEAM:4556627408
-S7LNS768PLPJ-S1X_TEAM:4556627552
-S7LWVWB7KD0N-S1X_TEAM:4556627681
-S7LVMQVQO77L-S1X_TEAM:4556627775
-S7LBAONCOOUN-S1X_TEAM:4556627859
-S7LMHYNJJESF-S1X_TEAM:4556628115
-S7LNQCP4T8E6-S1X_TEAM:4556629935
-S7LUN3WUDSNH-S1X_TEAM:4556630056
-S7LIW7XKPPC1-S1X_TEAM:4556630344
-S7LXXC0AEGLF-S1X_TEAM:4556630552
-S7LG4YD0CTH0-S1X_TEAM:4556630642
-S7LAQI5BWJN8-S1X_TEAM:4556630751
-S7L7R9RKBQKY-S1X_TEAM:4556630844
-S7LQNW5IJ6WP-S1X_TEAM:4556630935
-S7LTKC2SZPX4-S1X_TEAM:4556631061
-S7LZD5OF0GZM-S1X_TEAM:4556631177
-S7LINI1E6BGE-S1X_TEAM:4556631357
-S7LUSZRCFQPS-S1X_TEAM:4556631445
-S7LJ9AJESU3Z-S1X_TEAM:4556631557
-S7L3VKF58LGG-S1X_TEAM:4556631634
-S7L9BAOHBZS0-S1X_TEAM:4556631732
-S7L6FUGTKIIG-S1X_TEAM:4556631828
-S7LMTVPGHZLG-S1X_TEAM:4556631930
-S7LREHLT9FCE-S1X_TEAM:4556632043
-S7LL3GHWEUIK-S1X_TEAM:4556632122
-S7LREDRZDSAJ-S1X_TEAM:4556632232
-S7L3RGLZHLDO-S1X_TEAM:4556632317
-S7L0SNBBG84I-S1X_TEAM:4556632507
-S7LWZE2PEL3W-S1X_TEAM:4556632761
-S7LFETLQ71U9-S1X_TEAM:4556632862
-S7LXEYIXW2CG-S1X_TEAM:4556632965
-S7L1BHKOPC1M-S1X_TEAM:4556633045
-S7LYPO4SPLFK-S1X_TEAM:4556633123
-S7L1RTSWA5YE-S1X_TEAM:4556633220
-S7LWCRAMH25Y-S1X_TEAM:4556633352
-S7LQHZ6MEWCD-S1X_TEAM:4556633483
-S7LKIFDAUBC6-S1X_TEAM:4556633607
-S7L7XW2QLWWX-S1X_TEAM:4556633791
-S7LHL6J5TBCS-S1X_TEAM:4556633932
-S7LMKR47ZXFQ-S1X_TEAM:4556634035
-S7LWTF3HPMXQ-S1X_TEAM:4556634146
-S7LCUTKTMTNR-S1X_TEAM:4556634256
-S7LAHZVO6V7D-S1X_TEAM:4556634373
-S7LZURLPY57Z-S1X_TEAM:4556634436
-S7L8EBPMY8CZ-S1X_TEAM:4556634509
-S7LTNBCLUL2S-S1X_TEAM:4556634606
-S7LV3NGR304T-S1X_TEAM:4556634711
-S7LTJSAZELZZ-S1X_TEAM:4556634808
-S7LEERBCZS5L-S1X_TEAM:4556634926
-S7L0SMKNBL5F-S1X_TEAM:4556635032
-S7LD5POOHCTJ-S1X_TEAM:4556635118
-S7LPTEZ2R8XM-S1X_TEAM:4556635207
-S7LBY7EJQVPU-S1X_TEAM:4556635278
-S7LSYB3IYDIG-S1X_TEAM:4556635388
-S7LXTKINM26Z-S1X_TEAM:4556635461
-S7L1GQG7J96P-S1X_TEAM:4556635535
-S7LCC5FZE6ZK-S1X_TEAM:4556635646
-S7LITKQF7WPX-S1X_TEAM:4556635723
-S7L6OGSBMCYX-S1X_TEAM:4556635803
-S7L2KJ92LH15-S1X_TEAM:4556635885
-S7L2N6KEYQAP-S1X_TEAM:4556636048
-S7LB11QEQIGO-S1X_TEAM:4556636147
-S7LGQZOKDZJB-S1X_TEAM:4556636234
-S7LQJU9IJ8HA-S1X_TEAM:4556636354
-S7LO7CSXSRQQ-S1X_TEAM:4556636423
-S7LJAYJJMHUL-S1X_TEAM:4556636520
-S7LUTYPMGATS-S1X_TEAM:4556636589
-S7L0SN2UZDCD-S1X_TEAM:4556636710
-S7LZKQHBMXM1-S1X_TEAM:4556636787
-S7LCEGV86NXS-S1X_TEAM:4556636888
-S7LUK7XND75L-S1X_TEAM:4556636957
-S7LLSFQXJP9F-S1X_TEAM:4556637056
-S7L4D2WYOPBQ-S1X_TEAM:4556637178
-S7L4KZY1RM8P-S1X_TEAM:4556637277
-S7LPYJMWMNBN-S1X_TEAM:4556637515
-S7LXIU9HPN9B-S1X_TEAM:4556637621
-S7LLA4OL2GAO-S1X_TEAM:4556637694
-S7LTHMA0WTNW-S1X_TEAM:4556637763
-S7LM2EFL0PN6-S1X_TEAM:4556637873
-S7LYOF1QHZGY-S1X_TEAM:4556637963
-S7LF10DITOXW-S1X_TEAM:4556638060
-S7L0J5WGMGZV-S1X_TEAM:4556638139
-S7LXQTVUA7S9-S1X_TEAM:4556638238
-S7LSWEHOLSNQ-S1X_TEAM:4556638302
-S7LCFYLEJKGD-S1X_TEAM:4556638471
-S7LEUCQ9RKVY-S1X_TEAM:4556638571
-S7LEOC9SP8SH-S1X_TEAM:4556638671
-S7LCPEX6VO9I-S1X_TEAM:4556638777
-S7LQY3P9CYMB-S1X_TEAM:4556638861
-S7LPW84CFCBT-S1X_TEAM:4556638973
-S7LVEZHYPSVZ-S1X_TEAM:4556639065
-S7LWDPZAQTSZ-S1X_TEAM:4556639271
-S7LVGCA4L2BK-S1X_TEAM:4556639481
-S7LJPVKNECHY-S1X_TEAM:4556639704
-S7LYNR7AATEQ-S1X_TEAM:4556639918
-S7LQKNTKUK0L-S1X_TEAM:4556640098
-S7L0GUVJQBKU-S1X_TEAM:4556640187
-S7LHUFHJF1BC-S1X_TEAM:4556640403
-S7LDVL1NGZXM-S1X_TEAM:4556640669
-S7LBPAHCIXZN-S1X_TEAM:4556640763
-S7LTOKDK599W-S1X_TEAM:4556641419
-S7L5Q983BHEA-S1X_TEAM:4556641623
-S7LKEADH1VRY-S1X_TEAM:4556641741
-S7LLT8Z6B9AM-S1X_TEAM:4556641937
-S7LKSALT7ZOP-S1X_TEAM:4556642016
-S7LPCOATMAK4-S1X_TEAM:4556642210
 """
 
 
 def _parse_accounts(raw):
     if not raw or not raw.strip():
         return []
-    parts = []
+    out = []
     for chunk in raw.replace(";", "\n").replace(",", "\n").splitlines():
         chunk = chunk.strip()
         if not chunk or chunk.startswith("#") or ":" not in chunk:
@@ -304,13 +90,11 @@ def _parse_accounts(raw):
         pw, uid = chunk.split(":", 1)
         pw, uid = pw.strip(), uid.strip()
         if pw and uid:
-            parts.append((uid, pw))
-    return parts[:MAX_ACCOUNTS]
+            out.append((uid, pw))
+    return out[:MAX_ACCOUNTS]
 
 
-_ACCOUNTS = _parse_accounts(
-    os.environ.get("FF_ACCOUNTS", "") or _DEFAULT_ACCOUNTS_RAW
-)
+_ACCOUNTS = _parse_accounts(_DEFAULT_ACCOUNTS_RAW)
 _ACCOUNTS_LOCK = threading.Lock()
 
 _LIVE_STATUS = {
@@ -332,9 +116,7 @@ def add_accounts(raw):
         added = 0
         for u, p in _parse_accounts(raw):
             if (u, p) not in existing and len(_ACCOUNTS) < MAX_ACCOUNTS:
-                _ACCOUNTS.append((u, p))
-                existing.add((u, p))
-                added += 1
+                _ACCOUNTS.append((u, p)); existing.add((u, p)); added += 1
         return added
 
 
@@ -367,13 +149,10 @@ def is_admin(key):
 def EnV_VaRiAnT(n):
     out = []
     while True:
-        b = n & 0x7F
-        n >>= 7
-        if n:
-            b |= 0x80
+        b = n & 0x7F; n >>= 7
+        if n: b |= 0x80
         out.append(b)
-        if not n:
-            break
+        if not n: break
     return bytes(out)
 
 
@@ -381,61 +160,46 @@ def ProToBuF(fields):
     p = bytearray()
     for f, v in fields.items():
         if isinstance(v, bool):
-            p.extend(EnV_VaRiAnT((f << 3) | 0))
-            p.extend(EnV_VaRiAnT(1 if v else 0))
+            p.extend(EnV_VaRiAnT((f << 3) | 0)); p.extend(EnV_VaRiAnT(1 if v else 0))
         elif isinstance(v, int):
-            p.extend(EnV_VaRiAnT((f << 3) | 0))
-            p.extend(EnV_VaRiAnT(v))
+            p.extend(EnV_VaRiAnT((f << 3) | 0)); p.extend(EnV_VaRiAnT(v))
         elif isinstance(v, str):
             d = v.encode()
-            p.extend(EnV_VaRiAnT((f << 3) | 2))
-            p.extend(EnV_VaRiAnT(len(d)))
-            p.extend(d)
+            p.extend(EnV_VaRiAnT((f << 3) | 2)); p.extend(EnV_VaRiAnT(len(d))); p.extend(d)
         elif isinstance(v, (bytes, bytearray)):
             d = bytes(v)
-            p.extend(EnV_VaRiAnT((f << 3) | 2))
-            p.extend(EnV_VaRiAnT(len(d)))
-            p.extend(d)
+            p.extend(EnV_VaRiAnT((f << 3) | 2)); p.extend(EnV_VaRiAnT(len(d))); p.extend(d)
     return bytes(p)
 
 
 def Read_VaRiAnT(data, pos):
-    result = 0
-    shift = 0
+    result = 0; shift = 0
     while pos < len(data):
-        b = data[pos]
-        pos += 1
+        b = data[pos]; pos += 1
         result |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            break
+        if not (b & 0x80): break
         shift += 7
     return result, pos
 
 
 def Parse_ProToBuF(data):
-    fields = {}
-    pos = 0
-    n = len(data)
+    fields = {}; pos = 0; n = len(data)
     while pos < n:
         try:
             key, pos = Read_VaRiAnT(data, pos)
         except Exception:
             break
-        fn = key >> 3
-        wt = key & 0x07
+        fn = key >> 3; wt = key & 0x07
         try:
             if wt == 0:
                 val, pos = Read_VaRiAnT(data, pos)
             elif wt == 2:
                 ln, pos = Read_VaRiAnT(data, pos)
-                val = data[pos:pos + ln]
-                pos += ln
+                val = data[pos:pos + ln]; pos += ln
             elif wt == 5:
-                val = data[pos:pos + 4]
-                pos += 4
+                val = data[pos:pos + 4]; pos += 4
             elif wt == 1:
-                val = data[pos:pos + 8]
-                pos += 8
+                val = data[pos:pos + 8]; pos += 8
             else:
                 break
         except Exception:
@@ -455,20 +219,16 @@ def Ua():
 
 def EnC_PacKeT(HeX, K, V):
     return AES.new(K, AES.MODE_CBC, V).encrypt(
-        pad(bytes.fromhex(HeX), 16)
-    ).hex()
+        pad(bytes.fromhex(HeX), 16)).hex()
 
 
 def EnC_Vr(N):
     H = []
     while True:
-        b = N & 0x7F
-        N >>= 7
-        if N:
-            b |= 0x80
+        b = N & 0x7F; N >>= 7
+        if N: b |= 0x80
         H.append(b)
-        if not N:
-            break
+        if not N: break
     return bytes(H)
 
 
@@ -506,8 +266,7 @@ def GeneRaTePk(Pk, N, K, V):
     PkEnc = EnC_PacKeT(Pk, K, V)
     length_hex = DecodE_HeX(len(PkEnc) // 2)
     padding = {2: "000000", 3: "00000", 4: "0000", 5: "000"}.get(
-        len(length_hex), "00000"
-    )
+        len(length_hex), "00000")
     return bytes.fromhex(N + padding + length_hex + PkEnc)
 
 
@@ -573,10 +332,8 @@ def Send_GhosTs(uid, name, sq, key, iv, lang="en"):
     fields = {
         1: 61, 2: {
             1: int(uid),
-            2: {
-                1: int(uid), 2: 1159, 3: name, 5: 12, 6: 9999,
-                7: 1, 8: {2: 1, 3: 1}, 9: 3, 10: lang,
-            },
+            2: {1: int(uid), 2: 1159, 3: name, 5: 12, 6: 9999,
+                7: 1, 8: {2: 1, 3: 1}, 9: 3, 10: lang},
             3: sq,
         },
     }
@@ -651,7 +408,8 @@ def Strip_MajorLogin_Prefix(body):
 
 def GeT_AccEss(uid, password):
     url = "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant"
-    headers = {"User-Agent": Ua(), "Content-Type": "application/json; charset=utf-8"}
+    headers = {"User-Agent": Ua(),
+               "Content-Type": "application/json; charset=utf-8"}
     payload = {
         "client_id": 100067,
         "client_secret": "2ee44819e9b4598845141067b281621874"
@@ -662,7 +420,7 @@ def GeT_AccEss(uid, password):
     }
     try:
         R = requests.post(url, headers=headers, json=payload,
-                          verify=False, timeout=15)
+                          verify=False, timeout=LOGIN_TIMEOUT)
     except Exception:
         return None
     if R.status_code not in (200, 201):
@@ -674,7 +432,8 @@ def GeT_AccEss(uid, password):
     if J.get("code") != 0:
         return None
     d = J.get("data", {})
-    return {"access_token": d.get("access_token"), "open_id": d.get("open_id")}
+    return {"access_token": d.get("access_token"),
+            "open_id": d.get("open_id")}
 
 
 def MajorLogin(Payload):
@@ -689,7 +448,7 @@ def MajorLogin(Payload):
     }
     try:
         R = requests.post(url, headers=headers, data=Payload,
-                          verify=False, timeout=15)
+                          verify=False, timeout=LOGIN_TIMEOUT)
     except Exception:
         return None
     return R.content if R.status_code in (200, 201) and R.content else None
@@ -708,7 +467,7 @@ def GeTLoginDaTa(client_url, payload, jwt):
     }
     try:
         R = requests.post(url, headers=headers, data=payload,
-                          verify=False, timeout=15)
+                          verify=False, timeout=LOGIN_TIMEOUT)
     except Exception:
         return None
     return R.content if R.status_code == 200 and R.content else None
@@ -747,8 +506,7 @@ def login_account(acc_uid, acc_pass):
     td = GeT_AccEss(acc_uid, acc_pass)
     if not td:
         return None
-    access_token = td["access_token"]
-    open_id = td["open_id"]
+    access_token = td["access_token"]; open_id = td["open_id"]
     if not access_token or not open_id:
         return None
     login_payload = PyL(access_token, open_id)
@@ -771,20 +529,14 @@ def login_account(acc_uid, acc_pass):
     gl = Parse_ProToBuF(ld)
 
     def gv(n):
-        v = gl.get(n)
-        return v[0] if isinstance(v, list) else v
-
+        v = gl.get(n); return v[0] if isinstance(v, list) else v
     def gs(n):
-        v = gv(n)
-        return v.decode() if isinstance(v, (bytes, bytearray)) else v
-
+        v = gv(n); return v.decode() if isinstance(v, (bytes, bytearray)) else v
     def gi(n):
-        v = gv(n)
-        return int(v) if isinstance(v, int) else None
+        v = gv(n); return int(v) if isinstance(v, int) else None
 
     player_name = gs(4) or ""
-    func_addr = gs(14)
-    info_addr = gs(32)
+    func_addr = gs(14); info_addr = gs(32)
     if not func_addr or not info_addr:
         return None
     ip, port = func_addr.split(":")
@@ -799,7 +551,7 @@ def login_account(acc_uid, acc_pass):
 
 
 # ═══════════════════════════════════════════════════════════
-#  🌐  TCP SESSION
+#  🌐  TCP SESSION (v3.2 speed-tuned)
 # ═══════════════════════════════════════════════════════════
 
 def BuildAuthToken(uid, jwt_str, ts, key, iv, mode="online"):
@@ -807,8 +559,7 @@ def BuildAuthToken(uid, jwt_str, ts, key, iv, mode="online"):
     if len(ah) > 16:
         raise ValueError("uid hex too long")
     enc = AES.new(key, AES.MODE_CBC, iv).encrypt(
-        pad(jwt_str.encode(), 16)
-    ).hex()
+        pad(jwt_str.encode(), 16)).hex()
     th = f"{int(ts):x}"
     if len(th) % 2:
         th = "0" + th
@@ -820,9 +571,20 @@ def BuildAuthToken(uid, jwt_str, ts, key, iv, mode="online"):
 def _TuneSock(s):
     s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     try:
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+    except Exception:
+        pass
+    try:
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 2)
+    except Exception:
+        pass
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                     struct.pack("ii", 1, 0))
     except Exception:
         pass
 
@@ -833,25 +595,32 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
     result = {"tag": tag, "uid": uid, "status": "started",
               "sent": 0, "error": None}
     try:
-        s = socket.create_connection((host, int(port)), timeout=15)
-        s.settimeout(20)
+        s = socket.create_connection((host, int(port)),
+                                     timeout=TCP_CONNECT_TIMEOUT)
+        s.settimeout(6)
         _TuneSock(s)
-        s.sendall(bytes.fromhex(BuildAuthToken(uid, jwt, ts, key, iv, mode=mode)))
+        s.sendall(bytes.fromhex(
+            BuildAuthToken(uid, jwt, ts, key, iv, mode=mode)))
 
         try:
-            barrier.wait(timeout=max(1, deadline - time.time()))
+            barrier.wait(timeout=max(0.5, deadline - time.time()))
         except Exception:
             pass
         if time.time() > deadline:
             result["status"] = "timeout_before_join"
             return result
 
-        s.sendall(Join_Team(team_code, key, iv))
-        result["sent"] += 1
+        join_pkt = Join_Team(team_code, key, iv)
+        for _ in range(3):
+            try:
+                s.sendall(join_pkt); result["sent"] += 1
+            except Exception:
+                break
 
-        s.settimeout(1.0)
-        target_uid = None; squad_code = None; start = time.time()
-        while time.time() - start < 15 and time.time() < deadline:
+        s.settimeout(0.6)
+        target_uid = None; squad_code = None
+        t0 = time.time()
+        while time.time() - t0 < 5 and time.time() < deadline:
             try:
                 data = s.recv(65536)
                 if not data:
@@ -876,7 +645,7 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                     except Exception:
                         pass
             except socket.timeout:
-                pass
+                continue
             except Exception:
                 break
 
@@ -884,28 +653,30 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
             result["status"] = "no_team_data"
             return result
 
-        try:
-            s.close()
-        except Exception:
-            pass
+        try: s.close()
+        except Exception: pass
         if time.time() > deadline:
             result["status"] = "timeout_before_reconnect"
             return result
 
-        s = socket.create_connection((host, int(port)), timeout=15)
-        s.settimeout(20)
+        s = socket.create_connection((host, int(port)),
+                                     timeout=TCP_CONNECT_TIMEOUT)
+        s.settimeout(6)
         _TuneSock(s)
-        s.sendall(bytes.fromhex(BuildAuthToken(uid, jwt, ts, key, iv, mode=mode)))
-        time.sleep(0.3)
+        s.sendall(bytes.fromhex(
+            BuildAuthToken(uid, jwt, ts, key, iv, mode=mode)))
+        time.sleep(POST_LOGIN_WAIT)
 
-        s.sendall(SendInv(uid, target_uid, key, iv))
-        result["sent"] += 1
+        s.sendall(SendInv(uid, target_uid, key, iv)); result["sent"] += 1
         for _ in range(3):
-            s.sendall(Join_Team(team_code, key, iv))
-            time.sleep(0.02)
+            try:
+                s.sendall(join_pkt); result["sent"] += 1
+            except Exception:
+                break
+            time.sleep(0.005)
 
         try:
-            barrier.wait(timeout=max(1, deadline - time.time()))
+            barrier.wait(timeout=max(0.5, deadline - time.time()))
         except Exception:
             pass
         if time.time() > deadline:
@@ -919,10 +690,10 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                 s.sendall(ghost); result["sent"] += 1
             except Exception:
                 break
-            time.sleep(0.01)
+            time.sleep(0.005)
 
         try:
-            barrier.wait(timeout=max(1, deadline - time.time()))
+            barrier.wait(timeout=max(0.5, deadline - time.time()))
         except Exception:
             pass
         if time.time() < deadline:
@@ -947,21 +718,26 @@ def run_one_account(session_data, team_code, barrier, deadline):
     uid = session_data["uid"]
     jwt = session_data["jwt"]; ts = session_data["ts"]
     key = session_data["key"]; iv = session_data["iv"]
-    results = []
 
-    t1 = threading.Thread(
-        target=lambda: results.append(
-            _Session(session_data["ip"], session_data["port"], uid,
-                     jwt, ts, key, iv, "online", "ChaT",
-                     team_code, barrier, deadline)), daemon=True)
-    t2 = threading.Thread(
-        target=lambda: results.append(
-            _Session(session_data["ip2"], session_data["port2"], uid,
-                     jwt, ts, key, iv, "chat", "OnLinE",
-                     team_code, barrier, deadline)), daemon=True)
-    t1.start(); t2.start()
-    remaining = max(1, deadline - time.time())
-    t1.join(timeout=remaining); t2.join(timeout=remaining)
+    plans = [
+        (session_data["ip"],  session_data["port"],  "online", "ChaT"),
+        (session_data["ip2"], session_data["port2"], "chat",   "OnLinE"),
+        (session_data["ip"],  session_data["port"],  "online", "ChaT2"),
+        (session_data["ip2"], session_data["port2"], "chat",   "OnLinE2"),
+    ]
+
+    results = []; threads = []
+    for host, port, mode, tag in plans:
+        t = threading.Thread(
+            target=lambda h=host, p=port, m=mode, tg=tag: results.append(
+                _Session(h, p, uid, jwt, ts, key, iv, m, tg,
+                         team_code, barrier, deadline)),
+            daemon=True)
+        threads.append(t); t.start()
+
+    remaining = max(0.5, deadline - time.time())
+    for t in threads:
+        t.join(timeout=remaining)
     return results
 
 
@@ -1136,7 +912,7 @@ def _wrap(title, body):
 {body}
 <footer>
   <div class="xore">XORE</div>
-  <div>Powered by XORE · Free Fire OB55 · ME</div>
+  <div>Powered by XORE · Free Fire OB55 · ME · v3.2</div>
 </footer>
 </div>
 </body>
@@ -1152,10 +928,11 @@ def render_public():
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
-  <div class="tagline">FF BOT · OB55 · ME</div>
+  <div class="tagline">FF BOT · OB55 · ME · 4HB</div>
   <div class="status-bar">
     <div class="pill live"><span class="dot"></span> ONLINE</div>
     <div class="pill">جاهز للعمل</div>
+    <div class="pill">{HB_PER_ACCOUNT} اتصالات/حساب</div>
   </div>
 </div>
 
@@ -1201,31 +978,26 @@ def render_public():
 
   <div class="hint" style="text-align:center">
     اكتب كود الفريق اللي سوّيته في اللعبة، واضغط <strong>تشغيل البوت</strong>.<br>
-    النتيجة تظهر <strong>أسفل الصفحة</strong> بدون تغيير الصفحة.
+    كل حساب يفتح <strong>{HB_PER_ACCOUNT} اتصالات متوازية</strong> — النتيجة أسفل الصفحة بدون تغيير.
   </div>
 </div>
 
 <script>
+const MAX_SESSION = {MAX_SESSION_SECONDS};
 let timerInterval = null;
 let startTime = 0;
 
 function updateProgress() {{
   const elapsed = Math.floor((Date.now() - startTime) / 1000);
   document.getElementById('progressTime').textContent = elapsed + 's';
-  const pct = Math.min(95, (elapsed / 50) * 100);
+  const pct = Math.min(95, (elapsed / MAX_SESSION) * 100);
   document.getElementById('progressBar').style.width = pct + '%';
   const stageEl = document.getElementById('progressStage');
-  if (elapsed < 10) {{
-    stageEl.textContent = '🔑 تسجيل دخول الحسابات...';
-  }} else if (elapsed < 20) {{
-    stageEl.textContent = '🌐 فتح اتصالات TCP...';
-  }} else if (elapsed < 30) {{
-    stageEl.textContent = '🎯 إرسال JOIN...';
-  }} else if (elapsed < 40) {{
-    stageEl.textContent = '👻 إرسال GHOST...';
-  }} else {{
-    stageEl.textContent = '🚪 EXIT وتنظيف...';
-  }}
+  if (elapsed < 4)       stageEl.textContent = '🔑 تسجيل دخول الحسابات...';
+  else if (elapsed < 8)  stageEl.textContent = '🌐 فتح {HB_PER_ACCOUNT} اتصالات/حساب...';
+  else if (elapsed < 12) stageEl.textContent = '🎯 إرسال JOIN burst...';
+  else if (elapsed < 17) stageEl.textContent = '👻 إرسال GHOST burst...';
+  else                   stageEl.textContent = '🚪 EXIT وتنظيف...';
 }}
 
 async function startBot(e) {{
@@ -1279,21 +1051,26 @@ function renderResult(r) {{
   const team = r.team || '?';
 
   const results = (r.results || []).slice(0, 20);
+  const badgeCls = s => s === 'success' ? 'success'
+    : (String(s).includes('timeout') || s === 'no_team_data' ? 'warn' : 'error');
+
   const rowsHtml = results.map(x => {{
-    const chat = x.chat || '-';
-    const online = x.online || '-';
-    const cb = chat === 'success' ? 'success' : (chat.includes('timeout') || chat === 'no_team_data' ? 'warn' : 'error');
-    const ob = online === 'success' ? 'success' : (online.includes('timeout') || online === 'no_team_data' ? 'warn' : 'error');
+    const c1 = x.chat    || '-';
+    const o1 = x.online  || '-';
+    const c2 = x.chat2   || '-';
+    const o2 = x.online2 || '-';
     return `<tr>
       <td class="mono">${{x.uid || '?'}}</td>
-      <td><span class="badge ${{cb}}">${{chat}}</span></td>
-      <td><span class="badge ${{ob}}">${{online}}</span></td>
+      <td><span class="badge ${{badgeCls(c1)}}">${{c1}}</span></td>
+      <td><span class="badge ${{badgeCls(o1)}}">${{o1}}</span></td>
+      <td><span class="badge ${{badgeCls(c2)}}">${{c2}}</span></td>
+      <td><span class="badge ${{badgeCls(o2)}}">${{o2}}</span></td>
       <td class="mono">${{x.total_sent || 0}}</td>
     </tr>`;
-  }}).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">لا نتائج</td></tr>';
+  }}).join('') || '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:20px">لا نتائج</td></tr>';
 
   const extra = (r.results || []).length > 20
-    ? `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:12px">… و ${{r.results.length - 20}} حساب إضافي</td></tr>`
+    ? `<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:12px">… و ${{r.results.length - 20}} حساب إضافي</td></tr>`
     : '';
 
   const badge = isOk
@@ -1307,6 +1084,7 @@ function renderResult(r) {{
         ${{badge}}
         <span class="badge purple">فريق: ${{team}}</span>
         <span class="badge info">${{elapsed}}s</span>
+        <span class="badge info">${{r.hb_per_account || {HB_PER_ACCOUNT}}} HB/حساب</span>
       </div>
 
       <div class="stats" style="margin-bottom:20px">
@@ -1330,7 +1108,10 @@ function renderResult(r) {{
       </h3>
       <div style="overflow-x:auto;border:1px solid var(--border);border-radius:12px">
         <table class="table">
-          <thead><tr><th>UID</th><th>Chat</th><th>Online</th><th>Sent</th></tr></thead>
+          <thead><tr>
+            <th>UID</th><th>ChaT</th><th>OnLinE</th>
+            <th>ChaT2</th><th>OnLinE2</th><th>Sent</th>
+          </tr></thead>
           <tbody>${{rowsHtml}}${{extra}}</tbody>
         </table>
       </div>
@@ -1370,14 +1151,23 @@ def render_admin(key):
     else:
         live_html = '<div class="result-box"><div class="label">لم يتم الفحص بعد</div></div>'
 
+    rows = "".join(
+        f'<tr><td class="mono">{i+1}</td><td class="mono">{u}</td>'
+        f'<td class="mono">{p[:10]}…{p[-6:] if len(p)>16 else ""}</td></tr>'
+        for i, (u, p) in enumerate(accs[:60])
+    )
+    more = (f'<tr><td colspan="3" style="text-align:center;color:var(--muted);'
+            f'padding:16px">… و {count-60} إضافي</td></tr>') if count > 60 else ""
+
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
-  <div class="tagline">ADMIN PANEL</div>
+  <div class="tagline">ADMIN PANEL · v3.2</div>
   <div class="status-bar">
     <div class="pill live"><span class="dot"></span> ADMIN</div>
     <div class="pill">إجمالي: {count}</div>
     <div class="pill">الحد: {MAX_ACCOUNTS}</div>
+    <div class="pill">{HB_PER_ACCOUNT} HB/حساب</div>
   </div>
 </div>
 
@@ -1388,14 +1178,14 @@ def render_admin(key):
     <div class="value green">{live["alive"] if live["checked"] else "—"}</div></div>
   <div class="stat"><div class="label">حسابات معطّلة</div>
     <div class="value red">{live["dead"] if live["checked"] else "—"}</div></div>
-  <div class="stat"><div class="label">المنطقة</div>
-    <div class="value cyan">ME</div></div>
+  <div class="stat"><div class="label">سقف الوقت</div>
+    <div class="value cyan">{MAX_SESSION_SECONDS}s</div></div>
 </div>
 
 <div class="card">
   <h2>🔍 فحص الحسابات الحية</h2>
   <p style="color:var(--muted);font-size:13.5px;margin-bottom:18px">
-    اضغط الزر → يفحص كل الحسابات ويسجّل دخولها ويعرض عدد الشغّالة والمعطّلة.
+    اضغط الزر → يفحص كل الحسابات ويسجّل دخولها ويعرض الشغّالة والمعطّلة.
   </p>
   <button onclick="checkAccounts()" id="checkBtn">▶ فحص الحسابات الآن</button>
   <div id="liveResult">{live_html}</div>
@@ -1418,7 +1208,7 @@ def render_admin(key):
   <form method="post" action="/replace">
     <input type="hidden" name="key" value="{key}">
     <textarea name="raw"
-placeholder="password1:uid1&#10;password2:uid2&#10;password3:uid3&#10;... (حتى 500)"></textarea>
+placeholder="password1:uid1&#10;password2:uid2&#10;password3:uid3&#10;... (حتى {MAX_ACCOUNTS})"></textarea>
     <div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap">
       <button type="submit" name="mode" value="replace" class="danger">🔄 استبدال كلي</button>
       <button type="submit" name="mode" value="append" class="green">➕ إضافة للحالي</button>
@@ -1433,14 +1223,7 @@ placeholder="password1:uid1&#10;password2:uid2&#10;password3:uid3&#10;... (حت�
   <h2>👥 قائمة الحسابات ({count})</h2>
   <table class="table">
     <thead><tr><th style="width:50px">#</th><th>UID</th><th>Password</th></tr></thead>
-    <tbody>
-      {"".join(
-          f'<tr><td class="mono">{i+1}</td><td class="mono">{u}</td>'
-          f'<td class="mono">{p[:10]}…{p[-6:] if len(p)>16 else ""}</td></tr>'
-          for i,(u,p) in enumerate(accs[:60])
-      )}
-      {f'<tr><td colspan="3" style="text-align:center;color:var(--muted);padding:16px">… و {count-60} إضافي</td></tr>' if count > 60 else ''}
-    </tbody>
+    <tbody>{rows}{more}</tbody>
   </table>
 </div>
 
@@ -1478,7 +1261,7 @@ async function checkAccounts() {{
 #  🚀  FASTAPI APP
 # ═══════════════════════════════════════════════════════════
 
-app = FastAPI(title="XORE FF Bot", version="3.1.0")
+app = FastAPI(title="XORE FF Bot", version="3.2.0")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1488,41 +1271,42 @@ def root(key: str = Query("")):
     return render_public()
 
 
+@app.get("/health")
+def health():
+    return {"ok": True, "version": "3.2.0",
+            "hb_per_account": HB_PER_ACCOUNT,
+            "max_session_seconds": MAX_SESSION_SECONDS}
+
+
 @app.post("/check")
 def check_live(key: str = Query("")):
     if not is_admin(key):
         return JSONResponse(status_code=403,
                             content={"ok": False, "error": "invalid key"})
-
     accounts = get_accounts()
     if not accounts:
         return {"ok": False, "error": "no accounts"}
 
     _set_live_status(checking=True, checked=False,
                      total=len(accounts), started_at=time.time())
-
     results = []
-    max_workers = min(len(accounts), 20)
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(accounts), LOGIN_POOL)) as pool:
         futures = {pool.submit(login_account, u, p): u for u, p in accounts}
-        for f in as_completed(futures, timeout=40):
+        for f in as_completed(futures, timeout=60):
             uid = futures[f]
             try:
-                r = f.result(timeout=25)
+                r = f.result(timeout=LOGIN_TIMEOUT + 4)
             except Exception:
                 r = None
-            results.append({
-                "uid": uid, "ok": r is not None,
-                "name": r["name"] if r else None,
-                "error": None if r else "login failed",
-            })
+            results.append({"uid": uid, "ok": r is not None,
+                            "name": r["name"] if r else None,
+                            "error": None if r else "login failed"})
 
     alive = sum(1 for r in results if r["ok"])
     dead = len(results) - alive
     _set_live_status(checking=False, checked=True,
                      total=len(results), alive=alive, dead=dead,
                      results=results, finished_at=time.time())
-
     return {"ok": True, "total": len(results), "alive": alive,
             "dead": dead, "results": results}
 
@@ -1533,7 +1317,6 @@ def start_bot(
     key: str = Query(""),
     format: str = Query("json"),
 ):
-    """يرجع JSON دائماً — الصفحة العامة تستخدم AJAX."""
     if not team.strip():
         raise HTTPException(400, "Team code required")
 
@@ -1548,12 +1331,12 @@ def start_bot(
 
     sessions = []
     login_errors = []
-    with ThreadPoolExecutor(max_workers=min(len(accounts), 15)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(accounts), LOGIN_POOL)) as pool:
         futures = {uid: pool.submit(login_account, uid, pw)
                    for uid, pw in accounts}
         for uid, f in futures.items():
             try:
-                r = f.result(timeout=25)
+                r = f.result(timeout=LOGIN_TIMEOUT)
             except Exception as e:
                 r = None
                 login_errors.append({"uid": uid, "error": str(e)})
@@ -1568,9 +1351,10 @@ def start_bot(
             "team": team, "elapsed": round(time.time() - start_time, 2),
             "login_errors": login_errors, "results": [],
             "accounts_logged": 0, "accounts_ran": 0,
+            "hb_per_account": HB_PER_ACCOUNT,
         })
 
-    barrier = threading.Barrier(len(sessions))
+    barrier = threading.Barrier(len(sessions) * HB_PER_ACCOUNT)
     results = []; threads = []
     for s in sessions:
         t = threading.Thread(
@@ -1586,17 +1370,22 @@ def start_bot(
         uid = str(r.get("uid"))
         e = by_account.setdefault(uid, {
             "uid": uid, "chat": None, "online": None,
+            "chat2": None, "online2": None,
             "total_sent": 0, "errors": []})
-        if r["tag"] == "ChaT": e["chat"] = r["status"]
-        else: e["online"] = r["status"]
+        tag = r["tag"]
+        if   tag == "ChaT":    e["chat"]    = r["status"]
+        elif tag == "OnLinE":  e["online"]  = r["status"]
+        elif tag == "ChaT2":   e["chat2"]   = r["status"]
+        elif tag == "OnLinE2": e["online2"] = r["status"]
         e["total_sent"] += r.get("sent", 0)
-        if r.get("error"): e["errors"].append(f"{r['tag']}: {r['error']}")
+        if r.get("error"): e["errors"].append(f"{tag}: {r['error']}")
 
     return {
         "status": "completed", "team": team,
         "elapsed": round(time.time() - start_time, 2),
         "accounts_logged": len(sessions),
         "accounts_ran": len(by_account),
+        "hb_per_account": HB_PER_ACCOUNT,
         "login_errors": login_errors,
         "results": list(by_account.values()),
     }
@@ -1648,9 +1437,23 @@ def api_status():
     live = get_live_status()
     return {
         "status": "ok",
+        "version": "3.2.0",
         "accounts": len(get_accounts()),
         "max_accounts": MAX_ACCOUNTS,
+        "hb_per_account": HB_PER_ACCOUNT,
+        "max_session_seconds": MAX_SESSION_SECONDS,
         "alive": live["alive"] if live["checked"] else None,
         "dead": live["dead"] if live["checked"] else None,
         "release": "OB55", "region": "ME",
     }
+
+
+# ═══════════════════════════════════════════════════════════
+#  🏁  ENTRY
+# ═══════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port,
+                log_level="info", access_log=False)
