@@ -1,39 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XORE FF BOT — v5.0 (FULL SINGLE FILE)
+XORE FF BOT — v5.1 (FULL SINGLE FILE)
 ======================================
-Public  : Ghost 4HB (Speed 6x) — auto progress, realtime stats, no reload
-Admin   : Ghost + Blitz + Spam + Watch + Accounts CRUD (all AJAX) + Logs + Stats
+Public  : Ghost 4HB (Speed 6x)
+Admin   : Ghost + Blitz + Spam + Watch + Accounts CRUD (AJAX) + Logs + Stats
 
-NEW in v5.0:
-  [Account Manager — AJAX, no page reload]
-    - Add / Replace via fetch(), result inline di bawah form
-    - Batch select (checkboxes) + bulk enable/disable/delete
-    - Sort (UID / status / alias / added_at)
-    - Pagination (25/50/100 per page)
-    - Live search dengan counter realtime
-    - Quick filter: All / Enabled / Disabled / Alive / Dead
-    - Alias + Note per akun
-    - Password reveal/hide toggle
-    - UID copy + Password copy (dua tombol)
-    - Test single akun langsung dari list
-    - Duplicate detection saat import
-    - Auto-save draft textarea ke localStorage
-  [Dashboard]
-    - Live stats polling (auto-refresh 2s, toggleable)
-    - Currently-running modules indicator (ghost/blitz/spam/watch)
-    - Session history (last 50 runs)
-    - Toast notification system (success/error/info/warn)
-    - Sound alert toggle on events
-    - Compact / Expanded view toggle
-    - Dark / Light theme toggle
-  [Export]
-    - TXT / JSON / CSV
-  [Misc]
-    - Keyboard shortcuts (Ctrl+S save, Ctrl+F search, Esc close)
-    - Webhook notification endpoint (optional)
-    - Health endpoint extended
+v5.1 FIXES (Welcome Message Delivery):
+  [BUG 1] watch_worker deadline كان +60s فقط — الآن +WATCH_KEEPALIVE+30
+  [BUG 2] _extract_member_uids قوي: يتعامل مع int / str / bytes / nested
+  [BUG 3] welcome channel fallback: يجرب [1, 6, 8] تلقائياً
+  [BUG 4] logging تفصيلي داخل watch loop (pkts / uid_hits / welcomes)
+  [NEW]   /watch-debug — ring buffer لآخر 100 packet مستلمة
+  [NEW]   /watch-test-welcome — اختبار 4 قنوات على uid معين
+  [NEW]   _dump_packet() داخلي لكل packet مستلم
+
+v5.0 (base):
+  - Account Manager AJAX (no page reload)
+  - Batch select + bulk enable/disable/delete/test
+  - Sort + pagination + live search + filters
+  - Alias + Note per account
+  - Password reveal toggle
+  - Export TXT / CSV / JSON
+  - Live stats polling + running modules indicator
+  - Session history (last 50)
+  - Toast notifications + optional sound
+  - Dark / Light theme toggle
+  - Draft autosave (localStorage)
 """
 import csv
 import io
@@ -51,7 +44,8 @@ import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import (HTMLResponse, JSONResponse,
+                                PlainTextResponse, Response)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -83,6 +77,7 @@ SEND_RETRIES        = int(os.environ.get("SEND_RETRIES", "5"))
 WELCOME_MSG          = os.environ.get("WELCOME_MSG", "اهلا من مهدي")
 WELCOME_ENABLED      = os.environ.get("WELCOME_ENABLED", "1") == "1"
 WELCOME_CHANNEL      = int(os.environ.get("WELCOME_CHANNEL", "1"))
+WELCOME_CHANNELS_TRY = [WELCOME_CHANNEL, 6, 8, 1]  # fallback order
 WATCH_KEEPALIVE      = int(os.environ.get("WATCH_KEEPALIVE", "600"))
 WATCH_KEEPALIVE_PING = int(os.environ.get("WATCH_KEEPALIVE_PING", "18"))
 WATCH_BASELINE_WAIT  = float(os.environ.get("WATCH_BASELINE_WAIT", "3.0"))
@@ -132,9 +127,7 @@ _ACCOUNTS = _parse_accounts(_DEFAULT_ACCOUNTS_RAW)
 _DISABLED_UIDS = set()
 _ACCOUNTS_LOCK = threading.Lock()
 
-# Per-account metadata (alias, note, timestamps, last known status)
-_ACCOUNT_META = {}   # uid -> {"alias": str, "note": str, "added_at": float,
-                     #         "last_status": str, "last_check": float}
+_ACCOUNT_META = {}
 _META_LOCK = threading.Lock()
 
 
@@ -337,6 +330,7 @@ _LIVE_LOCK = threading.Lock()
 _WATCH_STATE = {
     "active": False, "team": None, "started_at": 0,
     "sessions": 0, "welcomed": 0, "events": [],
+    "pkts_total": 0, "uid_hits_total": 0,
 }
 _WATCH_LOCK = threading.Lock()
 _WATCH_STOP_EVENTS = []
@@ -373,8 +367,26 @@ _STATS_LOCK = threading.Lock()
 _ACTIVITY_LOG = []
 _ACTIVITY_LOCK = threading.Lock()
 
-_HISTORY = []   # newest first
+_HISTORY = []
 _HISTORY_LOCK = threading.Lock()
+
+# Packet ring buffer for /watch-debug
+_PACKET_DUMP = []
+_PACKET_DUMP_LOCK = threading.Lock()
+
+
+def _dump_packet(uid, tag, hx, decoded=None):
+    with _PACKET_DUMP_LOCK:
+        _PACKET_DUMP.insert(0, {
+            "t": time.strftime("%H:%M:%S"),
+            "uid": uid, "tag": tag,
+            "len": len(hx) // 2,
+            "opcode": hx[:4] if len(hx) >= 4 else "",
+            "decoded": (decoded[:500] if isinstance(decoded, str)
+                        else str(decoded)[:500] if decoded else None),
+            "hex_head": hx[:240],
+        })
+        del _PACKET_DUMP[200:]
 
 
 def _stats_inc(key, n=1):
@@ -433,6 +445,13 @@ def _watch_push_event(kind, uid=None):
         if kind == "welcome":
             _WATCH_STATE["welcomed"] += 1
     _activity(f"watch:{kind}", uid=uid)
+
+
+def _watch_stats_inc(pkts=0, uid_hits=0):
+    with _WATCH_LOCK:
+        _WATCH_STATE["pkts_total"] = _WATCH_STATE.get("pkts_total", 0) + pkts
+        _WATCH_STATE["uid_hits_total"] = \
+            _WATCH_STATE.get("uid_hits_total", 0) + uid_hits
 
 
 def _spam_snapshot():
@@ -558,23 +577,55 @@ def Parse_ProToBuF(data):
     return fields
 
 
+# ═══════════════════════════════════════════════════════════
+#  🎯  MEMBER UID EXTRACTOR — v5.1 STRONG
+# ═══════════════════════════════════════════════════════════
+
 def _extract_member_uids(packet):
+    """Extract candidate player UIDs from decoded blackboxprotobuf JSON.
+    Handles: int, str-of-digits, bytes (4/8 byte BE, or ASCII digits),
+    nested lists/dicts, depth up to 12."""
     uids = set()
     if not isinstance(packet, dict):
         return uids
 
+    def _coerce_int(d):
+        if isinstance(d, bool):
+            return None
+        if isinstance(d, int):
+            return d
+        if isinstance(d, str) and d.isdigit():
+            try:
+                return int(d)
+            except Exception:
+                return None
+        if isinstance(d, (bytes, bytearray)):
+            try:
+                if len(d) in (4, 8):
+                    return int.from_bytes(d, "big")
+                s = d.decode("ascii", errors="ignore")
+                if s.isdigit():
+                    return int(s)
+            except Exception:
+                return None
+        return None
+
     def walk(node, depth=0):
-        if depth > 8 or not isinstance(node, dict):
+        if depth > 12:
             return
-        for k, v in node.items():
-            if isinstance(v, dict) and "data" in v:
-                d = v["data"]
-                if isinstance(d, int) and 100_000 < d < 99_999_999_999:
-                    uids.add(d)
-                walk(d, depth + 1)
-            elif isinstance(v, list):
-                for item in v:
-                    walk(item, depth + 1)
+        if isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        if "data" in node:
+            v = _coerce_int(node["data"])
+            if v is not None and 100_000 < v < 99_999_999_999:
+                uids.add(v)
+        for v in node.values():
+            walk(v, depth + 1)
+
     walk(packet)
     return uids
 
@@ -1031,6 +1082,7 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                 if not data:
                     break
                 hx = data.hex()
+                _dump_packet(uid, "join-rx", hx)
                 if hx.startswith("0500") and 100 < len(hx) < 5000:
                     try:
                         js = DeCode_PackEt(hx[10:])
@@ -1092,11 +1144,17 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
             if _fast_send(s, ghost):
                 result["sent"] += 1
 
+        # ═══════════════════════════════════════════════════
+        #  WATCH MODE — v5.1 FIXED
+        # ═══════════════════════════════════════════════════
         if watch_state is not None and WELCOME_ENABLED:
             result["status"] = "watching"
             watch_deadline = time.time() + WATCH_KEEPALIVE
             last_ping = time.time()
             s.settimeout(0.8)
+            packet_count = 0
+            uid_hits = 0
+            welcomes_sent = 0
 
             while (time.time() < watch_deadline
                    and not watch_state["stop"].is_set()):
@@ -1104,19 +1162,29 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                     data = s.recv(65536)
                     if not data:
                         break
+                    packet_count += 1
                     hx = data.hex()
-                    if not hx.startswith("0500") or len(hx) < 20:
+                    _dump_packet(uid, "watch-rx", hx)
+
+                    if not hx.startswith("0500"):
+                        continue
+                    payload = hx[10:] if len(hx) > 10 else ""
+                    if not payload:
                         continue
                     try:
-                        js = DeCode_PackEt(hx[10:])
-                        if not js: continue
-                        packet = json.loads(js)
+                        js = DeCode_PackEt(payload)
+                        if not js:
+                            continue
+                        packet = json.loads(js) if isinstance(js, str) else js
                     except Exception:
                         continue
 
                     members = _extract_member_uids(packet)
-                    if not members: continue
+                    uid_hits += len(members)
+                    if not members:
+                        continue
 
+                    # baseline window — collect silently
                     if (not watch_state["baseline_done"]
                             and time.time() - watch_state["started"]
                                 < WATCH_BASELINE_WAIT):
@@ -1130,22 +1198,35 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                             watch_state["known"].update(members)
 
                     for nu in members:
-                        if nu == int(uid): continue
+                        if nu == int(uid):
+                            continue
                         is_new = False
                         with watch_state["lock"]:
                             if nu not in watch_state["known"]:
                                 watch_state["known"].add(nu)
                                 is_new = True
-                        if is_new:
+                        if not is_new:
+                            continue
+
+                        # try multiple channels
+                        sent_ok = False
+                        for ch in WELCOME_CHANNELS_TRY:
                             try:
                                 pkt = Send_TeamChat(
-                                    uid, WELCOME_MSG, squad_code,
-                                    key, iv, channel=WELCOME_CHANNEL)
+                                    uid, WELCOME_MSG,
+                                    squad_code or "0",
+                                    key, iv, channel=ch)
                                 s.sendall(pkt)
-                                result["welcomed"] += 1
-                                _watch_push_event("welcome", uid=nu)
+                                sent_ok = True
+                                break
                             except Exception:
-                                _watch_push_event("welcome_fail", uid=nu)
+                                continue
+                        if sent_ok:
+                            welcomes_sent += 1
+                            result["welcomed"] += 1
+                            _watch_push_event("welcome", uid=nu)
+                        else:
+                            _watch_push_event("welcome_fail", uid=nu)
 
                 except socket.timeout:
                     if time.time() - last_ping > WATCH_KEEPALIVE_PING:
@@ -1157,6 +1238,10 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                     continue
                 except Exception:
                     break
+
+            _watch_stats_inc(pkts=packet_count, uid_hits=uid_hits)
+            _log(f"watch uid={uid} pkts={packet_count} "
+                 f"uid_hits={uid_hits} welcomes={welcomes_sent}")
 
             try:
                 s.sendall(ExiT(key, iv)); result["sent"] += 1
@@ -1229,7 +1314,7 @@ def run_one_account(session_data, team_code, barrier, deadline,
 
 
 # ═══════════════════════════════════════════════════════════
-#  💥  SPAM / 🌍  BLITZ
+#  💥  SPAM  /  🌍  BLITZ
 # ═══════════════════════════════════════════════════════════
 
 def _SpamCycle(session_data, team_code, stop_event, rate, duration):
@@ -1316,6 +1401,7 @@ def _BlitzWorker(session_data, team_code, stop_event, linger_s, chat_msg):
                 data = s.recv(65536)
                 if not data: break
                 hx = data.hex()
+                _dump_packet(uid, "blitz-rx", hx)
                 if hx.startswith("0500") and 100 < len(hx) < 5000:
                     try:
                         js = DeCode_PackEt(hx[10:])
@@ -1370,7 +1456,7 @@ def _BlitzWorker(session_data, team_code, stop_event, linger_s, chat_msg):
 
 
 # ═══════════════════════════════════════════════════════════
-#  🎨  CSS — upgraded
+#  🎨  CSS — v5.1
 # ═══════════════════════════════════════════════════════════
 
 BASE_CSS = """
@@ -1378,8 +1464,7 @@ BASE_CSS = """
 :root{--bg:#06060a;--bg-2:#0d0d14;--card:#12121b;--card-2:#1a1a26;
  --border:#25253a;--text:#eaeaf2;--muted:#6f6f88;
  --xore-1:#8b5cf6;--xore-2:#06b6d4;--xore-3:#ec4899;
- --success:#10f098;--warn:#f5b800;--error:#f43f5e;
- --row-h:44px}
+ --success:#10f098;--warn:#f5b800;--error:#f43f5e}
 body.light{--bg:#f5f5fa;--bg-2:#ffffff;--card:#ffffff;--card-2:#f0f0f5;
  --border:#dcdce8;--text:#101018;--muted:#6b6b80}
 html,body{background:var(--bg);color:var(--text);
@@ -1555,8 +1640,6 @@ footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
 .log-line .k.check{color:var(--xore-3)}
 .log-line .msg{color:var(--text);opacity:.85;flex:1;overflow:hidden;
  text-overflow:ellipsis;white-space:nowrap}
-
-/* toasts */
 .toast-wrap{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);
  display:flex;flex-direction:column;gap:10px;z-index:99999;pointer-events:none;
  max-width:92vw}
@@ -1568,8 +1651,6 @@ footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
 .toast.error{border-color:rgba(244,63,94,.5);color:var(--error)}
 .toast.warn{border-color:rgba(245,184,0,.5);color:var(--warn)}
 .toast.info{border-color:rgba(6,182,212,.5);color:var(--xore-2)}
-
-/* running modules indicator */
 .mods{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 20px}
 .mod{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;
  border-radius:99px;font-size:11px;font-weight:800;letter-spacing:.5px;
@@ -1579,11 +1660,7 @@ footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
  box-shadow:0 0 16px rgba(16,240,152,.2)}
 .mod.on .dot{background:var(--success);box-shadow:0 0 10px var(--success);
  animation:pulse 1.5s infinite}
-
-/* checkbox */
 .chk{width:18px;height:18px;accent-color:var(--xore-1);cursor:pointer}
-
-/* filter chips */
 .filters{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
 .fchip{padding:5px 12px;border-radius:99px;background:var(--bg-2);
  border:1px solid var(--border);font-size:11.5px;font-weight:700;
@@ -1591,29 +1668,27 @@ footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
 .fchip:hover{border-color:var(--xore-2);color:var(--xore-2)}
 .fchip.active{background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
  color:#fff;border-color:transparent}
-
-/* pagination */
 .pager{display:flex;gap:6px;align-items:center;justify-content:center;
  margin-top:12px;flex-wrap:wrap;font-size:12px;color:var(--muted);font-weight:700}
 .pager button{padding:6px 12px;font-size:12px;border-radius:8px}
-
-/* reveal pw */
 .pw-cell{letter-spacing:1px;user-select:all}
 .pw-hidden{filter:blur(4px);user-select:none}
-
-/* batch bar */
 .batch-bar{display:none;align-items:center;gap:10px;padding:12px 16px;
  background:linear-gradient(135deg,rgba(139,92,246,.12),rgba(236,72,153,.12));
  border:1px solid rgba(139,92,246,.4);border-radius:12px;margin-bottom:12px;
  flex-wrap:wrap}
 .batch-bar.on{display:flex}
 .batch-bar .count{font-weight:900;color:var(--xore-1)}
-
-/* inline form result */
 .inline-result{margin-top:14px;padding:0;border-radius:12px;overflow:hidden;
  max-height:0;transition:max-height .3s ease-out}
 .inline-result.on{max-height:400px}
-
+.dbg-line{padding:8px 10px;border-bottom:1px solid var(--border);
+ font-family:'JetBrains Mono',monospace;font-size:11px;display:flex;
+ gap:10px;align-items:center;flex-wrap:wrap}
+.dbg-line .op{color:var(--xore-2);font-weight:800}
+.dbg-line .len{color:var(--muted)}
+.dbg-line .hh{color:var(--text);opacity:.6;font-size:10.5px;word-break:break-all;
+ max-width:100%;overflow:hidden}
 @media (max-width:640px){
  .container{padding:18px 12px 50px}
  .logo{font-size:38px;letter-spacing:8px}
@@ -1628,7 +1703,7 @@ footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
 """
 
 
-def _wrap(title, body, show_admin=True):
+def _wrap(title, body):
     return f"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -1645,7 +1720,7 @@ def _wrap(title, body, show_admin=True):
 {body}
 <footer>
   <div class="xore">XORE</div>
-  <div>Powered by XORE · Free Fire OB55 · ME · v5.0 · DEV EDITION</div>
+  <div>Powered by XORE · Free Fire OB55 · ME · v5.1 · DEV EDITION</div>
 </footer>
 </div>
 <div class="toast-wrap" id="toastWrap"></div>
@@ -1869,7 +1944,7 @@ function renderResult(r) {{
 
 
 # ═══════════════════════════════════════════════════════════
-#  📄  ADMIN PAGE — full upgrade
+#  📄  ADMIN PAGE — v5.1
 # ═══════════════════════════════════════════════════════════
 
 def render_admin(key):
@@ -1915,7 +1990,7 @@ def render_admin(key):
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
-  <div class="tagline"><span class="admin-tag">DEV v5.0</span> CONTROL PANEL</div>
+  <div class="tagline"><span class="admin-tag">DEV v5.1</span> CONTROL PANEL</div>
   <div class="status-bar">
     <div class="pill live"><span class="dot"></span> ADMIN</div>
     <div class="pill">إجمالي: <span id="hdrTotal">{count}</span></div>
@@ -1987,10 +2062,10 @@ def render_admin(key):
 
 <!-- WATCH -->
 <div class="card">
-  <h2>👋 Auto-Welcome</h2>
+  <h2>👋 Auto-Welcome <span class="admin-tag">v5.1 FIX</span></h2>
   <p style="color:var(--muted);font-size:13px;margin-bottom:12px">
     الترحيب: <code style="background:#000;padding:2px 8px;border-radius:4px;color:var(--xore-2)">{WELCOME_MSG}</code>
-    · قناة: {WELCOME_CHANNEL}
+    · قناة أساسية: {WELCOME_CHANNEL} · fallback: {WELCOME_CHANNELS_TRY}
   </p>
   <div class="input-row">
     <input type="text" id="watchTeam" placeholder="كود الفريق..."
@@ -2000,6 +2075,11 @@ def render_admin(key):
     <button onclick="saveTeam('watchTeam')" class="sm cyan">⭐ احفظ</button>
   </div>
   <div id="watchStatus" style="margin-top:14px"></div>
+  <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+    <button onclick="showWatchDebug()" class="sm cyan">🔍 عرض Packets</button>
+    <button onclick="testWelcome()" class="sm purple" style="background:linear-gradient(135deg,var(--xore-1),var(--xore-3))">🧪 اختبار 4 قنوات</button>
+  </div>
+  <div id="watchDebugResult" style="margin-top:14px"></div>
 </div>
 
 <!-- SPAM -->
@@ -2032,7 +2112,7 @@ def render_admin(key):
   <div id="liveResult">{live_html}</div>
 </div>
 
-<!-- ACCOUNTS MANAGER (AJAX) -->
+<!-- ACCOUNTS MANAGER -->
 <div class="card">
   <h2>👥 إدارة الحسابات <span class="badge purple" id="acctCountBadge">{count}</span></h2>
 
@@ -2040,7 +2120,7 @@ def render_admin(key):
 
   <textarea id="rawInput" placeholder="password:uid&#10;password:uid&#10;..." spellcheck="false"></textarea>
   <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
-    <button type="button" onclick="submitAccounts('append')" class="green" id="btnAppend">➕ إضافة (بدون تحديث الصفحة)</button>
+    <button type="button" onclick="submitAccounts('append')" class="green" id="btnAppend">➕ إضافة (AJAX)</button>
     <button type="button" onclick="submitAccounts('replace')" class="danger" id="btnReplace">🔄 استبدال الكل</button>
     <button type="button" onclick="exportAccounts('txt')" class="cyan">⬇ TXT</button>
     <button type="button" onclick="exportAccounts('csv')" class="cyan">⬇ CSV</button>
@@ -2048,8 +2128,7 @@ def render_admin(key):
     <button type="button" onclick="clearAccounts()" class="gray">🗑 مسح الكل</button>
   </div>
   <div class="hint">
-    الصيغة: <code>password:uid</code> سطر لكل حساب. يمكن الفصل بـ <code>;</code> أو <code>,</code>.
-    التكرارات تُتجاهل تلقائياً. النتائج تظهر تحت بدون إعادة تحميل.
+    الصيغة: <code>password:uid</code> سطر لكل حساب. التكرارات تُتجاهل. بدون إعادة تحميل الصفحة.
   </div>
 </div>
 
@@ -2106,7 +2185,7 @@ def render_admin(key):
           <th>Alias / Note</th>
           <th>Password</th>
           <th>الحالة</th>
-          <th style="width:220px">إجراءات</th>
+          <th style="width:230px">إجراءات</th>
         </tr>
       </thead>
       <tbody id="accBody"><tr><td colspan="7" style="text-align:center;color:var(--muted);padding:20px">تحميل...</td></tr></tbody>
@@ -2141,10 +2220,8 @@ def render_admin(key):
 <script>
 const KEY = "{key}";
 const MAX_ACCOUNTS = {MAX_ACCOUNTS};
+const DEFAULT_WELCOME = "{WELCOME_MSG}";
 
-// ═══════════════════════════════════════════════════════════
-//  STATE
-// ═══════════════════════════════════════════════════════════
 const UI = {{
   page: 1, pageSize: 50, filter: 'all', sort: 'added_desc', q: '',
   reveal: false, autoRefresh: true,
@@ -2152,9 +2229,7 @@ const UI = {{
   lastList: null,
 }};
 
-// ═══════════════════════════════════════════════════════════
-//  PRESETS
-// ═══════════════════════════════════════════════════════════
+// ═══ PRESETS ═══
 function getPresets() {{
   try {{ return JSON.parse(localStorage.getItem('xore_presets') || '[]'); }}
   catch {{ return []; }}
@@ -2192,12 +2267,8 @@ function pickTeam(t) {{
 }}
 renderPresets();
 
-// ═══════════════════════════════════════════════════════════
-//  UTILS
-// ═══════════════════════════════════════════════════════════
-function toast(msg, kind) {{
-  if (window.XORE_TOAST) window.XORE_TOAST(msg, kind || 'info');
-}}
+// ═══ UTILS ═══
+function toast(msg, kind) {{ if (window.XORE_TOAST) window.XORE_TOAST(msg, kind || 'info'); }}
 async function copyText(t) {{
   try {{
     await navigator.clipboard.writeText(t);
@@ -2215,15 +2286,8 @@ function esc(s) {{
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }}
-function fmtTime(ts) {{
-  if (!ts) return '';
-  const d = new Date(ts * 1000);
-  return d.toLocaleTimeString('en-GB', {{hour12:false}});
-}}
 
-// ═══════════════════════════════════════════════════════════
-//  THEME / SOUND / AUTOREFRESH
-// ═══════════════════════════════════════════════════════════
+// ═══ THEME / SOUND / AUTOREFRESH ═══
 function toggleTheme() {{
   const light = document.body.classList.toggle('light');
   document.getElementById('themeBtn').textContent = light ? '☀️' : '🌙';
@@ -2235,7 +2299,6 @@ function toggleTheme() {{
     const b = document.getElementById('themeBtn'); if (b) b.textContent = '☀️';
   }}
 }})();
-
 function toggleSound() {{
   window.XORE_SOUNDON = !window.XORE_SOUNDON;
   document.getElementById('soundBtn').textContent = window.XORE_SOUNDON ? '🔔' : '🔇';
@@ -2246,23 +2309,19 @@ window.XORE_SOUNDON = localStorage.getItem('xore_sound') === '1';
   const b = document.getElementById('soundBtn');
   if (b) b.textContent = window.XORE_SOUNDON ? '🔔' : '🔇';
 }})();
-
 function toggleAutoRefresh() {{
   UI.autoRefresh = !UI.autoRefresh;
   document.getElementById('arBtn').textContent = UI.autoRefresh ? '⏸ تلقائي' : '▶ تلقائي';
   toast(UI.autoRefresh ? 'التحديث التلقائي مفعل' : 'التحديث التلقائي موقوف', 'info');
 }}
 
-// ═══════════════════════════════════════════════════════════
-//  INLINE ACCOUNT SUBMIT — NO PAGE RELOAD
-// ═══════════════════════════════════════════════════════════
+// ═══ INLINE ACCOUNT SUBMIT ═══
 async function submitAccounts(mode) {{
   const raw = document.getElementById('rawInput').value;
   const out = document.getElementById('addResult');
   if (!raw.trim()) {{
     out.innerHTML = '<div class="result-box" style="border-color:var(--warn)"><div class="label" style="color:var(--warn)">⚠️ أدخل بيانات أولاً</div></div>';
-    toast('الحقل فارغ', 'warn');
-    return;
+    toast('الحقل فارغ', 'warn'); return;
   }}
   const btn = mode === 'replace' ? document.getElementById('btnReplace') : document.getElementById('btnAppend');
   const oldTxt = btn.textContent;
@@ -2303,23 +2362,18 @@ async function submitAccounts(mode) {{
   }}
 }}
 
-// Draft autosave
 const rawEl = document.getElementById('rawInput');
 rawEl.value = localStorage.getItem('xore_draft') || '';
 rawEl.addEventListener('input', () => {{
   localStorage.setItem('xore_draft', rawEl.value);
 }});
 
-// ═══════════════════════════════════════════════════════════
-//  EXPORT
-// ═══════════════════════════════════════════════════════════
+// ═══ EXPORT ═══
 function exportAccounts(fmt) {{
   window.location.href = '/accounts/export-json?key=' + KEY + '&fmt=' + fmt;
 }}
 
-// ═══════════════════════════════════════════════════════════
-//  ACCOUNT LIST (AJAX)
-// ═══════════════════════════════════════════════════════════
+// ═══ ACCOUNT LIST ═══
 let searchTimer = null;
 function onSearchChange() {{
   clearTimeout(searchTimer);
@@ -2329,7 +2383,6 @@ function onSearchChange() {{
     reloadList();
   }}, 220);
 }}
-
 function setFilter(f) {{
   UI.filter = f; UI.page = 1;
   document.querySelectorAll('.fchip').forEach(c => {{
@@ -2337,7 +2390,6 @@ function setFilter(f) {{
   }});
   reloadList();
 }}
-
 function toggleAll(chk) {{
   if (!UI.lastList) return;
   const items = UI.lastList.items || [];
@@ -2345,16 +2397,11 @@ function toggleAll(chk) {{
     if (chk) UI.selected.add(it.uid);
     else UI.selected.delete(it.uid);
   }});
-  renderBatchBar();
-  renderAccountRows();
+  renderBatchBar(); renderAccountRows();
 }}
-
 function clearSelection() {{
-  UI.selected.clear();
-  renderBatchBar();
-  renderAccountRows();
+  UI.selected.clear(); renderBatchBar(); renderAccountRows();
 }}
-
 function toggleSelect(uid, chk) {{
   if (chk) UI.selected.add(uid);
   else UI.selected.delete(uid);
@@ -2362,7 +2409,6 @@ function toggleSelect(uid, chk) {{
   const tr = document.querySelector(`tr[data-uid="${{uid}}"]`);
   if (tr) tr.classList.toggle('selected', chk);
 }}
-
 function renderBatchBar() {{
   const bar = document.getElementById('batchBar');
   const c = document.getElementById('batchCount');
@@ -2370,12 +2416,11 @@ function renderBatchBar() {{
   bar.classList.toggle('on', n > 0);
   c.textContent = n;
 }}
-
 async function bulkOp(op) {{
   const uids = Array.from(UI.selected);
   if (!uids.length) return;
   if (op === 'delete') {{
-    if (!confirm(`حذف ${{uids.length}} حساب؟ لا يمكن التراجع.`)) return;
+    if (!confirm(`حذف ${{uids.length}} حساب؟`)) return;
   }}
   try {{
     const r = await fetch('/accounts/bulk', {{
@@ -2385,20 +2430,13 @@ async function bulkOp(op) {{
     }});
     const d = await r.json();
     if (!d.ok) throw new Error(d.error || 'فشل');
-    if (op === 'delete') toast(`حُذف ${{d.affected}} حساب`, 'success');
-    else if (op === 'enable') toast(`فُعّل ${{d.affected}} حساب`, 'success');
-    else if (op === 'disable') toast(`عُطّل ${{d.affected}} حساب`, 'warn');
-    else if (op === 'test') {{
-      toast(`اختُبر ${{d.affected}} — شغّال: ${{d.alive}} · معطّل: ${{d.dead}}`, 'info');
-    }}
-    UI.selected.clear();
-    renderBatchBar();
-    reloadList();
-  }} catch (e) {{
-    toast(e.message, 'error');
-  }}
+    if (op === 'delete') toast(`حُذف ${{d.affected}}`, 'success');
+    else if (op === 'enable') toast(`فُعّل ${{d.affected}}`, 'success');
+    else if (op === 'disable') toast(`عُطّل ${{d.affected}}`, 'warn');
+    else if (op === 'test') toast(`اختُبر ${{d.affected}} — شغّال:${{d.alive}} معطّل:${{d.dead}}`, 'info');
+    UI.selected.clear(); renderBatchBar(); reloadList();
+  }} catch (e) {{ toast(e.message, 'error'); }}
 }}
-
 async function reloadList() {{
   try {{
     const params = new URLSearchParams({{
@@ -2411,8 +2449,7 @@ async function reloadList() {{
     UI.lastList = d;
     document.getElementById('acctCountBadge').textContent = d.total_all;
     document.getElementById('hdrTotal').textContent = d.total_all;
-    renderAccountRows();
-    renderPager();
+    renderAccountRows(); renderPager();
     UI.selected.forEach(uid => {{
       const tr = document.querySelector(`tr[data-uid="${{uid}}"]`);
       if (tr) tr.classList.add('selected');
@@ -2422,10 +2459,8 @@ async function reloadList() {{
       `<tr><td colspan="7" style="text-align:center;color:var(--error);padding:20px">خطأ: ${{esc(e.message)}}</td></tr>`;
   }}
 }}
-
 function renderAccountRows() {{
-  const d = UI.lastList;
-  if (!d) return;
+  const d = UI.lastList; if (!d) return;
   const items = d.items || [];
   if (!items.length) {{
     document.getElementById('accBody').innerHTML =
@@ -2457,8 +2492,8 @@ function renderAccountRows() {{
       <td class="mono pw-cell">${{pwDisplay}}</td>
       <td>${{statusBadge(it)}}</td>
       <td style="white-space:nowrap">
-        <button class="xs cyan" onclick="copyText('${{esc(it.uid)}}')" title="نسخ UID">📋 UID</button>
-        <button class="xs cyan" onclick="copyText('${{esc(it.password)}}')" title="نسخ كلمة السر">🔑 PW</button>
+        <button class="xs cyan" onclick="copyText('${{esc(it.uid)}}')" title="نسخ UID">📋</button>
+        <button class="xs cyan" onclick="copyText('${{esc(it.password)}}')" title="نسخ PW">🔑</button>
         <button class="xs ${{it.enabled?'warn':'green'}}"
                 onclick="toggleAccount('${{esc(it.uid)}}')">${{it.enabled?'⏸':'▶'}}</button>
         <button class="xs purple" style="background:linear-gradient(135deg,var(--xore-1),var(--xore-3))"
@@ -2470,7 +2505,6 @@ function renderAccountRows() {{
     </tr>`;
   }}).join('');
 }}
-
 function renderPager() {{
   const d = UI.lastList;
   const totalPages = Math.max(1, Math.ceil(d.total_filtered / d.page_size));
@@ -2478,12 +2512,10 @@ function renderPager() {{
   const info = document.getElementById('pagerInfo');
   info.textContent = `عرض ${{d.items.length}} من ${{d.total_filtered}} (إجمالي الكل: ${{d.total_all}})`;
   if (totalPages <= 1) {{ pager.innerHTML = ''; return; }}
-  const cur = d.page;
-  const buttons = [];
+  const cur = d.page; const buttons = [];
   buttons.push(`<button class="sm gray" onclick="goPage(1)" ${{cur===1?'disabled':''}}>⏮</button>`);
   buttons.push(`<button class="sm gray" onclick="goPage(${{cur-1}})" ${{cur===1?'disabled':''}}>◀</button>`);
-  const start = Math.max(1, cur - 3);
-  const end = Math.min(totalPages, cur + 3);
+  const start = Math.max(1, cur - 3), end = Math.min(totalPages, cur + 3);
   for (let p = start; p <= end; p++) {{
     buttons.push(`<button class="sm ${{p===cur?'cyan':'gray'}}" onclick="goPage(${{p}})">${{p}}</button>`);
   }}
@@ -2491,18 +2523,13 @@ function renderPager() {{
   buttons.push(`<button class="sm gray" onclick="goPage(${{totalPages}})" ${{cur===totalPages?'disabled':''}}>⏭</button>`);
   pager.innerHTML = buttons.join('');
 }}
-
 function goPage(p) {{ UI.page = p; reloadList(); }}
-
 function toggleRevealAll() {{
   UI.reveal = !UI.reveal;
   document.getElementById('revealBtn').textContent = UI.reveal ? '🙈 إخفاء' : '👁 كشف';
   renderAccountRows();
 }}
 
-// ═══════════════════════════════════════════════════════════
-//  ACCOUNT ACTIONS
-// ═══════════════════════════════════════════════════════════
 async function toggleAccount(uid) {{
   try {{
     const r = await fetch('/accounts/toggle?uid=' + encodeURIComponent(uid) + '&key=' + KEY);
@@ -2510,7 +2537,6 @@ async function toggleAccount(uid) {{
     if (d.ok) {{ toast(d.enabled ? 'مفعّل' : 'معطّل', d.enabled?'success':'warn'); reloadList(); }}
   }} catch (e) {{ toast(e.message, 'error'); }}
 }}
-
 async function deleteAccount(uid) {{
   if (!confirm('حذف ' + uid + '؟')) return;
   try {{
@@ -2519,7 +2545,6 @@ async function deleteAccount(uid) {{
     if (d.ok) {{ toast('تم الحذف', 'success'); reloadList(); }}
   }} catch (e) {{ toast(e.message, 'error'); }}
 }}
-
 async function testOne(uid) {{
   toast('جاري اختبار ' + uid + '...', 'info');
   try {{
@@ -2531,14 +2556,11 @@ async function testOne(uid) {{
     reloadList();
   }} catch (e) {{ toast(e.message, 'error'); }}
 }}
-
 async function editMeta(uid) {{
   const it = (UI.lastList.items || []).find(x => x.uid === uid);
   if (!it) return;
-  const alias = prompt('Alias (اسم مختصر):', it.alias || '');
-  if (alias === null) return;
-  const note = prompt('ملاحظة:', it.note || '');
-  if (note === null) return;
+  const alias = prompt('Alias:', it.alias || ''); if (alias === null) return;
+  const note = prompt('ملاحظة:', it.note || ''); if (note === null) return;
   try {{
     const r = await fetch('/accounts/meta', {{
       method: 'POST',
@@ -2550,7 +2572,6 @@ async function editMeta(uid) {{
     else toast(d.error || 'فشل', 'error');
   }} catch (e) {{ toast(e.message, 'error'); }}
 }}
-
 async function clearAccounts() {{
   if (!confirm('مسح كل الحسابات؟ لا يمكن التراجع.')) return;
   if (!confirm('تأكيد أخير — سيتم حذف الكل.')) return;
@@ -2565,9 +2586,7 @@ async function clearAccounts() {{
   }} catch (e) {{ toast(e.message, 'error'); }}
 }}
 
-// ═══════════════════════════════════════════════════════════
-//  GHOST / BLITZ / WATCH / SPAM (same as v4.2 + toasts)
-// ═══════════════════════════════════════════════════════════
+// ═══ GHOST ═══
 async function startGhost() {{
   const team = document.getElementById('ghostTeam').value.trim();
   if (!team) return toast('أدخل كود الفريق', 'warn');
@@ -2576,4 +2595,58 @@ async function startGhost() {{
   btn.disabled = true; btn.innerHTML = '...<span class="spinner"></span>';
   out.innerHTML = '<div class="result-box"><div class="label">⏳ يشتغل...</div></div>';
   try {{
-    const r = await fetch('/
+    const r = await fetch('/start?team=' + encodeURIComponent(team) + '&format=json');
+    const d = await r.json();
+    out.innerHTML = `
+      <div class="result-box">
+        <div><div class="label">دخلت</div><div class="big green">${{d.accounts_logged||0}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">نفذت</div><div class="big purple">${{d.accounts_ran||0}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">مدة</div><div class="big cyan">${{d.elapsed||0}}s</div></div>
+      </div>`;
+    toast('Ghost: ' + (d.accounts_logged||0) + ' حساب', 'success');
+  }} catch(e) {{
+    out.innerHTML = `<div class="result-box"><div class="label" style="color:var(--error)">${{e.message}}</div></div>`;
+    toast(e.message, 'error');
+  }}
+  btn.disabled = false; btn.innerHTML = '👻 بدء Ghost';
+}}
+
+// ═══ BLITZ ═══
+async function startBlitz() {{
+  const team = document.getElementById('blitzTeam').value.trim();
+  const cnt = document.getElementById('blitzCount').value.trim() || '{BLITZ_ACCOUNTS_MAX}';
+  const lng = document.getElementById('blitzLinger').value.trim() || '{BLITZ_LINGER_S}';
+  const msg = document.getElementById('blitzMsg').value.trim() || DEFAULT_WELCOME;
+  if (!team) return toast('أدخل كود الفريق', 'warn');
+  const btn = document.getElementById('blitzBtn');
+  btn.disabled = true; btn.textContent = '...';
+  try {{
+    const url = `/blitz?team=${{encodeURIComponent(team)}}&accounts=${{cnt}}&linger=${{lng}}`
+      + `&msg=${{encodeURIComponent(msg)}}&key=${{KEY}}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (!d.ok) toast('خطأ: ' + (d.error || 'فشل'), 'error');
+    else toast('Blitz بدأ على ' + d.accounts + ' حساب', 'success');
+  }} catch(e) {{ toast(e.message, 'error'); }}
+  btn.disabled = false; btn.textContent = '🌍 ابدأ الانفجار';
+  refreshBlitz();
+}}
+async function stopBlitz() {{
+  await fetch('/stop-blitz?key=' + KEY);
+  refreshBlitz();
+  toast('Blitz موقوف', 'warn');
+}}
+async function refreshBlitz() {{
+  if (!UI.autoRefresh) return;
+  try {{
+    const r = await fetch('/blitz-status');
+    const d = await r.json();
+    const el = document.getElementById('blitzStatus');
+    if (!d.active) {{ el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>'; return; }}
+    const pct = d.total ? Math.floor((d.joined / d.total) * 100) : 0;
+    const evs = (d.events || []).slice(0, 12).map(e =>
+      `<tr><td class="mono">${{e.t}}</td><td>${{e.kind}}</td>
+       <td class="mono">${{e.uid || '-'}}</td></tr>`).join('')
+      || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">لا أحداث</
