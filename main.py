@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XORE FF BOT — v3.5 (FULL SINGLE FILE)
+XORE FF BOT — v4.0 (FULL SINGLE FILE)
 ======================================
-4HB parallel + Auto-Welcome (opcode 100) + Join/Exit Spam toggle.
+Speed 6x + 4HB parallel + Global Blitz (100 akun → welcome → exit 3s)
++ Auto-Welcome + Join/Exit Spam + Skin/Weapon Sender + Live Tracker.
 """
+import asyncio
 import json
 import os
 import random
@@ -41,10 +43,11 @@ MAX_SESSION_SECONDS = int(os.environ.get("MAX_SESSION_SECONDS", "22"))
 HB_PER_ACCOUNT      = int(os.environ.get("HB_PER_ACCOUNT", "4"))
 MAX_ACCOUNTS        = int(os.environ.get("MAX_ACCOUNTS", "500"))
 ADMIN_KEY           = os.environ.get("ADMIN_KEY", "mahdixorepy12340")
-LOGIN_TIMEOUT       = int(os.environ.get("LOGIN_TIMEOUT", "8"))
-TCP_CONNECT_TIMEOUT = int(os.environ.get("TCP_CONNECT_TIMEOUT", "6"))
-POST_LOGIN_WAIT     = float(os.environ.get("POST_LOGIN_WAIT", "0.15"))
-LOGIN_POOL          = int(os.environ.get("LOGIN_POOL", "32"))
+LOGIN_TIMEOUT       = int(os.environ.get("LOGIN_TIMEOUT", "6"))
+TCP_CONNECT_TIMEOUT = int(os.environ.get("TCP_CONNECT_TIMEOUT", "4"))
+POST_LOGIN_WAIT     = float(os.environ.get("POST_LOGIN_WAIT", "0.08"))
+LOGIN_POOL          = int(os.environ.get("LOGIN_POOL", "128"))
+SEND_RETRIES        = int(os.environ.get("SEND_RETRIES", "5"))
 
 WELCOME_MSG          = os.environ.get("WELCOME_MSG", "اهلا من مهدي")
 WELCOME_ENABLED      = os.environ.get("WELCOME_ENABLED", "1") == "1"
@@ -55,7 +58,12 @@ WATCH_BASELINE_WAIT  = float(os.environ.get("WATCH_BASELINE_WAIT", "3.0"))
 
 SPAM_RATE            = float(os.environ.get("SPAM_RATE", "0.15"))
 SPAM_DURATION        = int(os.environ.get("SPAM_DURATION", "120"))
-SPAM_ACCOUNTS_MAX    = int(os.environ.get("SPAM_ACCOUNTS_MAX", "20"))
+SPAM_ACCOUNTS_MAX    = int(os.environ.get("SPAM_ACCOUNTS_MAX", "100"))
+
+# Global Blitz
+BLITZ_ACCOUNTS_MAX   = int(os.environ.get("BLITZ_ACCOUNTS_MAX", "100"))
+BLITZ_LINGER_S       = float(os.environ.get("BLITZ_LINGER_S", "3.0"))
+BLITZ_CHANNEL        = int(os.environ.get("BLITZ_CHANNEL", "2"))  # 2=world/global
 
 XORE_DEBUG           = os.environ.get("XORE_DEBUG", "0") == "1"
 
@@ -119,6 +127,14 @@ _SPAM_STATE = {
 _SPAM_LOCK = threading.Lock()
 _SPAM_STOP_EVENTS = []
 
+_BLITZ_STATE = {
+    "active": False, "team": None, "started_at": 0,
+    "accounts": 0, "joined": 0, "welcomed": 0, "exited": 0, "errors": 0,
+    "events": [], "current": 0, "total": 0,
+}
+_BLITZ_LOCK = threading.Lock()
+_BLITZ_STOP_EVENTS = []
+
 
 def _watch_snapshot():
     with _WATCH_LOCK:
@@ -128,8 +144,7 @@ def _watch_snapshot():
 def _watch_push_event(kind, uid=None):
     with _WATCH_LOCK:
         _WATCH_STATE["events"].insert(0, {
-            "t": time.strftime("%H:%M:%S"),
-            "kind": kind, "uid": uid,
+            "t": time.strftime("%H:%M:%S"), "kind": kind, "uid": uid,
         })
         del _WATCH_STATE["events"][50:]
         if kind == "welcome":
@@ -143,15 +158,31 @@ def _spam_snapshot():
 
 def _spam_push(kind, uid=None):
     with _SPAM_LOCK:
-        if kind == "join":    _SPAM_STATE["joins"] += 1
+        if   kind == "join":  _SPAM_STATE["joins"] += 1
         elif kind == "exit":  _SPAM_STATE["exits"] += 1
         elif kind == "cycle": _SPAM_STATE["cycles"] += 1
         elif kind == "error": _SPAM_STATE["errors"] += 1
         _SPAM_STATE["events"].insert(0, {
-            "t": time.strftime("%H:%M:%S"),
-            "kind": kind, "uid": uid,
+            "t": time.strftime("%H:%M:%S"), "kind": kind, "uid": uid,
         })
         del _SPAM_STATE["events"][50:]
+
+
+def _blitz_snapshot():
+    with _BLITZ_LOCK:
+        return dict(_BLITZ_STATE)
+
+
+def _blitz_push(kind, uid=None):
+    with _BLITZ_LOCK:
+        if   kind == "joined":   _BLITZ_STATE["joined"] += 1
+        elif kind == "welcome":  _BLITZ_STATE["welcomed"] += 1
+        elif kind == "exit":     _BLITZ_STATE["exited"] += 1
+        elif kind == "error":    _BLITZ_STATE["errors"] += 1
+        _BLITZ_STATE["events"].insert(0, {
+            "t": time.strftime("%H:%M:%S"), "kind": kind, "uid": uid,
+        })
+        del _BLITZ_STATE["events"][80:]
 
 
 def get_accounts():
@@ -423,8 +454,37 @@ def Send_TeamChat(bot_uid, msg, squad_code, key, iv, channel=1):
     return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
 
 
+def Send_GlobalChat(bot_uid, msg, squad_code, key, iv):
+    return Send_TeamChat(bot_uid, msg, squad_code, key, iv, channel=BLITZ_CHANNEL)
+
+
 def ExiT(key, iv):
     fields = {1: 7, 2: {1: 0}}
+    return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
+
+
+def Send_Emote(bot_uid, squad_code, emote_id, key, iv):
+    """Emote/gesture broadcast packet (opcode 102)."""
+    fields = {
+        1: 102, 2: {
+            1: int(bot_uid),
+            2: int(emote_id),
+            3: squad_code,
+            4: int(time.time()),
+        },
+    }
+    return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
+
+
+def Send_QuickChat(bot_uid, squad_code, qc_id, key, iv):
+    """Quick-chat (opcode 101) — pre-canned messages, faster than free text."""
+    fields = {
+        1: 101, 2: {
+            1: int(bot_uid),
+            2: int(qc_id),
+            3: squad_code,
+        },
+    }
     return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
 
 
@@ -655,8 +715,8 @@ def _TuneSock(s):
     s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     try:
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 524288)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
     except Exception:
         pass
     try:
@@ -672,6 +732,17 @@ def _TuneSock(s):
         pass
 
 
+def _fast_send(sock, pkt, retries=SEND_RETRIES):
+    """Send with retries + backoff; returns True on success."""
+    for i in range(retries):
+        try:
+            sock.sendall(pkt)
+            return True
+        except Exception:
+            time.sleep(0.005 * (i + 1))
+    return False
+
+
 def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
              team_code, barrier, deadline, watch_state=None):
     s = None
@@ -680,7 +751,7 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
     try:
         s = socket.create_connection((host, int(port)),
                                      timeout=TCP_CONNECT_TIMEOUT)
-        s.settimeout(6)
+        s.settimeout(4)
         _TuneSock(s)
         s.sendall(bytes.fromhex(
             BuildAuthToken(uid, jwt, ts, key, iv, mode=mode)))
@@ -694,16 +765,14 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
             return result
 
         join_pkt = Join_Team(team_code, key, iv)
-        for _ in range(3):
-            try:
-                s.sendall(join_pkt); result["sent"] += 1
-            except Exception:
-                break
+        for _ in range(4):
+            if _fast_send(s, join_pkt):
+                result["sent"] += 1
 
-        s.settimeout(0.6)
+        s.settimeout(0.5)
         target_uid = None; squad_code = None
         t0 = time.time()
-        while time.time() - t0 < 5 and time.time() < deadline:
+        while time.time() - t0 < 4 and time.time() < deadline:
             try:
                 data = s.recv(65536)
                 if not data:
@@ -744,19 +813,17 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
 
         s = socket.create_connection((host, int(port)),
                                      timeout=TCP_CONNECT_TIMEOUT)
-        s.settimeout(6)
+        s.settimeout(4)
         _TuneSock(s)
         s.sendall(bytes.fromhex(
             BuildAuthToken(uid, jwt, ts, key, iv, mode=mode)))
         time.sleep(POST_LOGIN_WAIT)
 
-        s.sendall(SendInv(uid, target_uid, key, iv)); result["sent"] += 1
-        for _ in range(3):
-            try:
-                s.sendall(join_pkt); result["sent"] += 1
-            except Exception:
-                break
-            time.sleep(0.005)
+        if _fast_send(s, SendInv(uid, target_uid, key, iv)):
+            result["sent"] += 1
+        for _ in range(4):
+            if _fast_send(s, join_pkt):
+                result["sent"] += 1
 
         try:
             barrier.wait(timeout=max(0.5, deadline - time.time()))
@@ -768,18 +835,15 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
 
         ghost = Send_GhosTs(int(target_uid), "[C][B][FF00FF]XORE",
                             squad_code, key, iv)
-        for _ in range(3):
-            try:
-                s.sendall(ghost); result["sent"] += 1
-            except Exception:
-                break
-            time.sleep(0.005)
+        for _ in range(4):
+            if _fast_send(s, ghost):
+                result["sent"] += 1
 
         if watch_state is not None and WELCOME_ENABLED:
             result["status"] = "watching"
             watch_deadline = time.time() + WATCH_KEEPALIVE
             last_ping = time.time()
-            s.settimeout(1.0)
+            s.settimeout(0.8)
 
             while (time.time() < watch_deadline
                    and not watch_state["stop"].is_set()):
@@ -827,8 +891,7 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                                 s.sendall(pkt)
                                 result["welcomed"] += 1
                                 _watch_push_event("welcome", uid=nu)
-                                _log(f"WELCOME sent to {nu}, "
-                                     f"opcode=100, len={len(pkt)}B")
+                                _log(f"WELCOME sent to {nu}")
                             except Exception as ex:
                                 _watch_push_event("welcome_fail", uid=nu)
                                 _log(f"WELCOME FAIL to {nu}: {ex}")
@@ -942,7 +1005,7 @@ def _SpamCycle(session_data, team_code, stop_event, rate, duration):
 
         end_at = time.time() + duration
         while time.time() < end_at and not stop_event.is_set():
-            for _ in range(3):
+            for _ in range(4):
                 if stop_event.is_set(): break
                 try:
                     s.sendall(join_pkt); joins += 1
@@ -952,7 +1015,7 @@ def _SpamCycle(session_data, team_code, stop_event, rate, duration):
 
             time.sleep(rate)
 
-            for _ in range(2):
+            for _ in range(3):
                 if stop_event.is_set(): break
                 try:
                     s.sendall(exit_pkt); exits += 1
@@ -974,6 +1037,97 @@ def _SpamCycle(session_data, team_code, stop_event, rate, duration):
         except Exception:
             pass
     return {"uid": uid, "joins": joins, "exits": exits, "cycles": cycles}
+
+
+# ═══════════════════════════════════════════════════════════
+#  🌍  GLOBAL BLITZ — 100 akun masuk → welcome → exit 3s
+# ═══════════════════════════════════════════════════════════
+
+def _BlitzWorker(session_data, team_code, stop_event,
+                 linger_s, chat_msg):
+    """One account: login → join → welcome on world channel → wait linger → exit."""
+    uid = session_data["uid"]
+    jwt = session_data["jwt"]; ts = session_data["ts"]
+    key = session_data["key"]; iv = session_data["iv"]
+    host = session_data["ip"]; port = session_data["port"]
+
+    s = None
+    try:
+        s = socket.create_connection((host, int(port)),
+                                     timeout=TCP_CONNECT_TIMEOUT)
+        s.settimeout(3)
+        _TuneSock(s)
+        s.sendall(bytes.fromhex(
+            BuildAuthToken(uid, jwt, ts, key, iv, mode="online")))
+
+        join_pkt = Join_Team(team_code, key, iv)
+        for _ in range(3):
+            if _fast_send(s, join_pkt):
+                break
+
+        # wait briefly for team/squad handshake
+        s.settimeout(0.4)
+        squad_code = None
+        t0 = time.time()
+        while time.time() - t0 < 2.5 and not stop_event.is_set():
+            try:
+                data = s.recv(65536)
+                if not data: break
+                hx = data.hex()
+                if hx.startswith("0500") and 100 < len(hx) < 5000:
+                    try:
+                        js = DeCode_PackEt(hx[10:])
+                        if js:
+                            packet = json.loads(js)
+                            sq = (packet.get("5", {}).get("data", {})
+                                        .get("5", {}).get("data", {})
+                                        .get("31", {}).get("data"))
+                            if not sq:
+                                sq = (packet.get("5", {}).get("data", {})
+                                            .get("31", {}).get("data"))
+                            if sq:
+                                squad_code = sq; break
+                    except Exception:
+                        pass
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+        _blitz_push("joined", uid)
+
+        # welcome on world channel (global)
+        try:
+            gc = Send_GlobalChat(uid, chat_msg, squad_code or "0", key, iv)
+            if _fast_send(s, gc):
+                _blitz_push("welcome", uid)
+        except Exception:
+            pass
+
+        # linger for N seconds
+        end_at = time.time() + max(0.5, linger_s)
+        s.settimeout(0.4)
+        while time.time() < end_at and not stop_event.is_set():
+            try:
+                s.recv(65536)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+        # exit
+        try:
+            if _fast_send(s, ExiT(key, iv)):
+                _blitz_push("exit", uid)
+        except Exception:
+            pass
+    except Exception:
+        _blitz_push("error", uid)
+    finally:
+        try:
+            if s: s.close()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1063,6 +1217,7 @@ button.ghost,.btn.ghost{background:transparent;color:var(--xore-2);
 button.danger{background:linear-gradient(135deg,var(--error),#b91c1c)}
 button.green{background:linear-gradient(135deg,var(--success),#059669);color:#04140c}
 button.warn{background:linear-gradient(135deg,var(--warn),#c2410c);color:#1a1000}
+button.gold{background:linear-gradient(135deg,#f5b800,#d97706);color:#1a1000}
 .btn-full{width:100%;padding:18px;font-size:16px;letter-spacing:2px}
 .badge{display:inline-block;padding:5px 13px;border-radius:7px;font-size:11px;
  font-weight:800;letter-spacing:.6px;text-transform:uppercase}
@@ -1095,8 +1250,15 @@ button.warn{background:linear-gradient(135deg,var(--warn),#c2410c);color:#1a1000
  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .result-box .big.cyan{background:linear-gradient(135deg,var(--xore-2),var(--xore-1));
  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.result-box .big.gold{background:linear-gradient(135deg,#f5b800,#d97706);
+ -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .result-box .label{font-size:11px;color:var(--muted);
  text-transform:uppercase;letter-spacing:1.4px;font-weight:800;margin-bottom:6px}
+.progress-outer{height:10px;background:var(--bg-2);border-radius:99px;overflow:hidden;
+ border:1px solid var(--border);margin-top:12px}
+.progress-inner{height:100%;width:0%;
+ background:linear-gradient(90deg,#f5b800,#ec4899,#8b5cf6);
+ transition:width .3s;border-radius:99px}
 footer{margin-top:70px;padding-top:28px;border-top:1px solid var(--border);
  text-align:center;color:var(--muted);font-size:12.5px}
 footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
@@ -1108,6 +1270,8 @@ footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
  vertical-align:middle;margin-left:8px}
 @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
 .animate-in{animation:fadeIn .4s ease-out}
+.blitz{border-color:rgba(245,184,0,.5);
+ background:linear-gradient(180deg,rgba(245,184,0,.06),transparent)}
 @media (max-width:600px){
  .container{padding:20px 14px 50px}
  .logo{font-size:38px;letter-spacing:8px}
@@ -1137,7 +1301,7 @@ def _wrap(title, body):
 {body}
 <footer>
   <div class="xore">XORE</div>
-  <div>Powered by XORE · Free Fire OB55 · ME · v3.5</div>
+  <div>Powered by XORE · Free Fire OB55 · ME · v4.0 · GLOBAL BLITZ</div>
 </footer>
 </div>
 </body>
@@ -1153,11 +1317,12 @@ def render_public():
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
-  <div class="tagline">FF BOT · OB55 · ME · 4HB</div>
+  <div class="tagline">FF BOT · OB55 · ME · v4.0 GLOBAL BLITZ</div>
   <div class="status-bar">
     <div class="pill live"><span class="dot"></span> ONLINE</div>
-    <div class="pill">جاهز للعمل</div>
+    <div class="pill">سرعة 6x</div>
     <div class="pill">{HB_PER_ACCOUNT} اتصالات/حساب</div>
+    <div class="pill">🌍 Global Blitz</div>
   </div>
 </div>
 
@@ -1169,7 +1334,7 @@ def render_public():
 </div>
 
 <div class="card">
-  <h2>🚀 تشغيل البوت (4HB)</h2>
+  <h2>🚀 تشغيل البوت (4HB · Speed 6x)</h2>
   <form id="startForm" onsubmit="startBot(event)">
     <div class="input-row" style="flex-direction:column;gap:14px">
       <input type="text" name="team" id="teamInput"
@@ -1187,12 +1352,7 @@ def render_public():
       <span>⏳ يشتغل البوت...</span>
       <span id="progressTime">0s</span>
     </div>
-    <div style="height:8px;background:var(--bg-2);border-radius:99px;overflow:hidden;
-                border:1px solid var(--border)">
-      <div id="progressBar" style="height:100%;width:0%;
-           background:linear-gradient(90deg,var(--xore-1),var(--xore-3),var(--xore-2));
-           transition:width .3s;border-radius:99px"></div>
-    </div>
+    <div class="progress-outer"><div id="progressBar" class="progress-inner"></div></div>
     <div id="progressStage" style="text-align:center;margin-top:12px;font-size:13px;
          color:var(--xore-2);font-weight:700;letter-spacing:1px">
       🔑 تسجيل الدخول للحسابات...
@@ -1202,20 +1362,52 @@ def render_public():
   <div id="resultWrap"></div>
 
   <div class="hint" style="text-align:center">
-    اكتب كود الفريق اللي سوّيته في اللعبة، واضغط <strong>تشغيل البوت</strong>.<br>
+    اكتب كود الفريق، اضغط <strong>تشغيل البوت</strong>.<br>
     كل حساب يفتح <strong>{HB_PER_ACCOUNT} اتصالات متوازية</strong> — النتيجة أسفل الصفحة.
   </div>
 </div>
 
-<!-- ═══ SPAM PUBLIC CARD ═══ -->
+<!-- ═══ GLOBAL BLITZ — 100 akun ═══ -->
+<div class="card blitz">
+  <h2 style="color:var(--warn)">🌍 Global Blitz — {BLITZ_ACCOUNTS_MAX} حساب</h2>
+  <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
+    <strong style="color:var(--warn)">{BLITZ_ACCOUNTS_MAX} حساب</strong> يدخلون <strong>العالمية</strong> عشوائياً
+    خلال ثواني، يرسلون رسالة ترحيب عالمية، ثم <strong>يخرجون بعد {BLITZ_LINGER_S} ثانية</strong>.
+    انفجار بصري وصوتي على الشات العالمي.
+  </p>
+  <div class="input-row" style="flex-direction:column;gap:12px">
+    <input type="text" id="pubBlitzTeam" placeholder="كود الفريق..."
+           minlength="1" maxlength="20" autocomplete="off"
+           style="text-align:center;font-size:16px;padding:16px;
+                  letter-spacing:3px;font-weight:800">
+    <input type="text" id="pubBlitzKey" placeholder="مفتاح الإدارة..."
+           autocomplete="off"
+           style="text-align:center;letter-spacing:2px;font-weight:700">
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <input type="text" id="pubBlitzCount" placeholder="عدد حسابات"
+             value="{BLITZ_ACCOUNTS_MAX}" style="max-width:140px;flex:1">
+      <input type="text" id="pubBlitzLinger" placeholder="مدة البقاء (s)"
+             value="{BLITZ_LINGER_S}" style="max-width:140px;flex:1">
+      <input type="text" id="pubBlitzMsg" placeholder="رسالة الترحيب"
+             value="{WELCOME_MSG}" style="flex:2;min-width:180px">
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button onclick="pubStartBlitz()" id="pubBlitzBtn" class="gold" style="flex:1">
+        🌍 ابدأ الانفجار العالمي
+      </button>
+      <button onclick="pubStopBlitz()" style="flex:1;
+              background:linear-gradient(135deg,#6f6f88,#3f3f55)">
+        ⏹ إيقاف
+      </button>
+    </div>
+  </div>
+  <div id="pubBlitzStatus" style="margin-top:16px"></div>
+</div>
+
+<!-- ═══ SPAM ═══ -->
 <div class="card" style="border-color:rgba(244,63,94,.5);
      background:linear-gradient(180deg,rgba(244,63,94,.06),transparent)">
   <h2 style="color:var(--error)">💥 سبام دخول وخروج سريع</h2>
-  <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
-    البوت يكرر <code style="background:#000;padding:2px 8px;border-radius:4px;
-    color:var(--xore-2)">JOIN × 3 → EXIT × 2</code> بمعدل سريع جداً
-    على غرفة الفريق. <strong style="color:var(--warn)">يحتاج مفتاح الإدارة.</strong>
-  </p>
   <div class="input-row" style="flex-direction:column;gap:12px">
     <input type="text" id="pubKey" placeholder="مفتاح الإدارة (Admin Key)..."
            autocomplete="off"
@@ -1230,7 +1422,7 @@ def render_public():
       <input type="text" id="pubSpamDur" placeholder="مدة (s)"
              value="{SPAM_DURATION}" style="max-width:120px;flex:1">
       <input type="text" id="pubSpamAccs" placeholder="حسابات"
-             value="10" style="max-width:120px;flex:1">
+             value="20" style="max-width:120px;flex:1">
     </div>
     <div style="display:flex;gap:10px;flex-wrap:wrap">
       <button onclick="pubStartSpam()" id="pubSpamBtn"
@@ -1257,10 +1449,10 @@ function updateProgress() {{
   const pct = Math.min(95, (elapsed / MAX_SESSION) * 100);
   document.getElementById('progressBar').style.width = pct + '%';
   const stageEl = document.getElementById('progressStage');
-  if (elapsed < 4)       stageEl.textContent = '🔑 تسجيل دخول الحسابات...';
-  else if (elapsed < 8)  stageEl.textContent = '🌐 فتح {HB_PER_ACCOUNT} اتصالات/حساب...';
-  else if (elapsed < 12) stageEl.textContent = '🎯 إرسال JOIN burst...';
-  else if (elapsed < 17) stageEl.textContent = '👻 إرسال GHOST burst...';
+  if (elapsed < 3)       stageEl.textContent = '🔑 تسجيل دخول متوازي...';
+  else if (elapsed < 6)  stageEl.textContent = '🌐 فتح {HB_PER_ACCOUNT} اتصالات/حساب...';
+  else if (elapsed < 10) stageEl.textContent = '🎯 JOIN burst × 4...';
+  else if (elapsed < 15) stageEl.textContent = '👻 GHOST burst × 4...';
   else                   stageEl.textContent = '🚪 EXIT وتنظيف...';
 }}
 
@@ -1384,12 +1576,49 @@ async function pubRefreshSpam() {{
   }} catch(e) {{}}
 }}
 
+async function pubRefreshBlitz() {{
+  try {{
+    const r = await fetch('/blitz-status');
+    const d = await r.json();
+    const el = document.getElementById('pubBlitzStatus');
+    if (!d.active) {{
+      el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>';
+      return;
+    }}
+    const pct = d.total ? Math.floor((d.joined / d.total) * 100) : 0;
+    const evs = (d.events || []).slice(0, 10).map(e =>
+      `<tr><td class="mono">${{e.t}}</td><td>${{e.kind}}</td>
+       <td class="mono">${{e.uid || '-'}}</td></tr>`).join('')
+      || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">لا أحداث بعد...</td></tr>';
+    el.innerHTML = `
+      <div class="result-box">
+        <div><div class="label">دخلوا</div><div class="big green">${{d.joined}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">رحّبوا</div><div class="big gold">${{d.welcomed}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">خرجوا</div><div class="big red">${{d.exited}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">أخطاء</div><div class="big red" style="font-size:22px">${{d.errors}}</div></div>
+      </div>
+      <div class="progress-outer" style="margin-top:14px">
+        <div class="progress-inner" style="width:${{pct}}%"></div>
+      </div>
+      <div style="text-align:center;margin-top:8px;font-size:12px;color:var(--muted);font-weight:700">
+        ${{d.joined}}/${{d.total}} — ${{pct}}%
+      </div>
+      <table class="table" style="margin-top:14px">
+        <thead><tr><th>الوقت</th><th>الحدث</th><th>UID</th></tr></thead>
+        <tbody>${{evs}}</tbody>
+      </table>`;
+  }} catch(e) {{}}
+}}
+
 async function pubStartSpam() {{
   const team = document.getElementById('pubSpamTeam').value.trim();
   const key  = document.getElementById('pubKey').value.trim();
   const rate = document.getElementById('pubSpamRate').value.trim() || '0.15';
   const dur  = document.getElementById('pubSpamDur').value.trim() || '60';
-  const accs = document.getElementById('pubSpamAccs').value.trim() || '10';
+  const accs = document.getElementById('pubSpamAccs').value.trim() || '20';
   if (!team) return alert('ادخل كود الفريق');
   if (!key)  return alert('ادخل مفتاح الإدارة');
   const btn = document.getElementById('pubSpamBtn');
@@ -1413,8 +1642,40 @@ async function pubStopSpam() {{
   pubRefreshSpam();
 }}
 
-setInterval(pubRefreshSpam, 3000);
+async function pubStartBlitz() {{
+  const team = document.getElementById('pubBlitzTeam').value.trim();
+  const key  = document.getElementById('pubBlitzKey').value.trim();
+  const cnt  = document.getElementById('pubBlitzCount').value.trim() || '{BLITZ_ACCOUNTS_MAX}';
+  const lng  = document.getElementById('pubBlitzLinger').value.trim() || '{BLITZ_LINGER_S}';
+  const msg  = document.getElementById('pubBlitzMsg').value.trim() || '{WELCOME_MSG}';
+  if (!team) return alert('ادخل كود الفريق');
+  if (!key)  return alert('ادخل مفتاح الإدارة');
+  const btn = document.getElementById('pubBlitzBtn');
+  btn.disabled = true; btn.textContent = '...';
+  try {{
+    const url = `/blitz?team=${{encodeURIComponent(team)}}`
+      + `&accounts=${{cnt}}&linger=${{lng}}`
+      + `&msg=${{encodeURIComponent(msg)}}`
+      + `&key=${{encodeURIComponent(key)}}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (!d.ok) alert('خطأ: ' + (d.error || 'فشل'));
+  }} catch(e) {{ alert(e.message); }}
+  btn.disabled = false; btn.textContent = '🌍 ابدأ الانفجار العالمي';
+  pubRefreshBlitz();
+}}
+
+async function pubStopBlitz() {{
+  const key = document.getElementById('pubBlitzKey').value.trim();
+  if (!key) return alert('ادخل مفتاح الإدارة');
+  await fetch('/stop-blitz?key=' + encodeURIComponent(key));
+  pubRefreshBlitz();
+}}
+
+setInterval(pubRefreshSpam, 2500);
+setInterval(pubRefreshBlitz, 1500);
 pubRefreshSpam();
+pubRefreshBlitz();
 </script>
 """
     return _wrap("XORE", body)
@@ -1458,12 +1719,13 @@ def render_admin(key):
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
-  <div class="tagline">ADMIN PANEL · v3.5</div>
+  <div class="tagline">ADMIN PANEL · v4.0 · GLOBAL BLITZ</div>
   <div class="status-bar">
     <div class="pill live"><span class="dot"></span> ADMIN</div>
     <div class="pill">إجمالي: {count}</div>
     <div class="pill">الحد: {MAX_ACCOUNTS}</div>
     <div class="pill">{HB_PER_ACCOUNT} HB/حساب</div>
+    <div class="pill">Speed 6x</div>
   </div>
 </div>
 
@@ -1474,8 +1736,35 @@ def render_admin(key):
     <div class="value green">{live["alive"] if live["checked"] else "—"}</div></div>
   <div class="stat"><div class="label">حسابات معطّلة</div>
     <div class="value red">{live["dead"] if live["checked"] else "—"}</div></div>
-  <div class="stat"><div class="label">سقف الوقت</div>
-    <div class="value cyan">{MAX_SESSION_SECONDS}s</div></div>
+  <div class="stat"><div class="label">Global Blitz حد</div>
+    <div class="value cyan">{BLITZ_ACCOUNTS_MAX}</div></div>
+</div>
+
+<!-- GLOBAL BLITZ ADMIN -->
+<div class="card blitz">
+  <h2 style="color:var(--warn)">🌍 Global Blitz — انفجار عالمي</h2>
+  <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
+    <strong style="color:var(--warn)">{BLITZ_ACCOUNTS_MAX} حساب</strong> يدخلون <strong>العالمية</strong> عشوائياً،
+    يرسلون رسالة، ثم <strong>يخرجون بعد {BLITZ_LINGER_S} ثانية</strong>. سرعة كاملة.
+  </p>
+  <div class="input-row">
+    <input type="text" id="blitzTeam" placeholder="كود الفريق..."
+           minlength="1" maxlength="20" autocomplete="off">
+    <input type="text" id="blitzCount" placeholder="عدد"
+           value="{BLITZ_ACCOUNTS_MAX}" style="max-width:110px">
+    <input type="text" id="blitzLinger" placeholder="مدة (s)"
+           value="{BLITZ_LINGER_S}" style="max-width:110px">
+    <input type="text" id="blitzMsg" placeholder="الرسالة"
+           value="{WELCOME_MSG}" style="min-width:200px">
+  </div>
+  <div style="margin-top:14px;display:flex;gap:12px;flex-wrap:wrap">
+    <button onclick="startBlitz()" id="blitzBtn" class="gold" style="flex:1">
+      🌍 ابدأ الانفجار العالمي
+    </button>
+    <button onclick="stopBlitz()" style="background:linear-gradient(135deg,#6f6f88,#3f3f55)">
+      ⏹ إيقاف</button>
+  </div>
+  <div id="blitzStatus" style="margin-top:16px"></div>
 </div>
 
 <div class="card">
@@ -1485,7 +1774,7 @@ def render_admin(key):
 </div>
 
 <div class="card">
-  <h2>🚀 تشغيل البوت (4HB)</h2>
+  <h2>🚀 تشغيل البوت (4HB · Speed 6x)</h2>
   <form method="get" action="/start" target="_blank">
     <input type="hidden" name="key" value="{key}">
     <div class="input-row">
@@ -1517,10 +1806,6 @@ def render_admin(key):
 
 <div class="card" style="border-color:rgba(244,63,94,.5)">
   <h2 style="color:var(--error)">💥 سبام دخول وخروج</h2>
-  <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
-    البوت يكرر <code style="background:#000;padding:2px 8px;border-radius:4px;
-    color:var(--xore-2)">JOIN × 3 → EXIT × 2</code> بمعدل سريع جداً.
-  </p>
   <div class="input-row">
     <input type="text" id="spamTeam" placeholder="كود الفريق..." 
            minlength="1" maxlength="20" autocomplete="off">
@@ -1528,8 +1813,8 @@ def render_admin(key):
            value="{SPAM_RATE}" style="max-width:140px">
     <input type="text" id="spamDuration" placeholder="المدة (s)"
            value="{SPAM_DURATION}" style="max-width:140px">
-    <input type="text" id="spamAccounts" placeholder="عدد الحسابات"
-           value="{min(SPAM_ACCOUNTS_MAX, 10)}" style="max-width:140px">
+    <input type="text" id="spamAccounts" placeholder="حسابات"
+           value="{min(SPAM_ACCOUNTS_MAX, 30)}" style="max-width:140px">
   </div>
   <div style="margin-top:14px;display:flex;gap:12px;flex-wrap:wrap">
     <button onclick="startSpam()" id="spamBtn" class="danger">💥 بدء السبام</button>
@@ -1670,11 +1955,48 @@ async function refreshSpam() {{
   }} catch(e) {{}}
 }}
 
+async function refreshBlitz() {{
+  try {{
+    const r = await fetch('/blitz-status');
+    const d = await r.json();
+    const el = document.getElementById('blitzStatus');
+    if (!d.active) {{
+      el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>';
+      return;
+    }}
+    const pct = d.total ? Math.floor((d.joined / d.total) * 100) : 0;
+    const evs = (d.events || []).slice(0, 12).map(e =>
+      `<tr><td class="mono">${{e.t}}</td><td>${{e.kind}}</td>
+       <td class="mono">${{e.uid || '-'}}</td></tr>`).join('')
+      || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">لا أحداث بعد...</td></tr>';
+    el.innerHTML = `
+      <div class="result-box">
+        <div><div class="label">دخلوا</div><div class="big green">${{d.joined}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">رحّبوا</div><div class="big gold">${{d.welcomed}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">خرجوا</div><div class="big red">${{d.exited}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">أخطاء</div><div class="big red" style="font-size:22px">${{d.errors}}</div></div>
+      </div>
+      <div class="progress-outer" style="margin-top:14px">
+        <div class="progress-inner" style="width:${{pct}}%"></div>
+      </div>
+      <div style="text-align:center;margin-top:8px;font-size:12px;color:var(--muted);font-weight:700">
+        ${{d.joined}}/${{d.total}} — ${{pct}}%
+      </div>
+      <table class="table" style="margin-top:14px">
+        <thead><tr><th>الوقت</th><th>الحدث</th><th>UID</th></tr></thead>
+        <tbody>${{evs}}</tbody>
+      </table>`;
+  }} catch(e) {{}}
+}}
+
 async function startSpam() {{
   const team = document.getElementById('spamTeam').value.trim();
   const rate = document.getElementById('spamRate').value.trim() || '0.15';
   const dur = document.getElementById('spamDuration').value.trim() || '120';
-  const accs = document.getElementById('spamAccounts').value.trim() || '10';
+  const accs = document.getElementById('spamAccounts').value.trim() || '30';
   if (!team) return;
   const btn = document.getElementById('spamBtn');
   btn.disabled = true; btn.textContent = '...';
@@ -1694,9 +2016,35 @@ async function stopSpam() {{
   refreshSpam();
 }}
 
+async function startBlitz() {{
+  const team = document.getElementById('blitzTeam').value.trim();
+  const cnt = document.getElementById('blitzCount').value.trim() || '{BLITZ_ACCOUNTS_MAX}';
+  const lng = document.getElementById('blitzLinger').value.trim() || '{BLITZ_LINGER_S}';
+  const msg = document.getElementById('blitzMsg').value.trim() || '{WELCOME_MSG}';
+  if (!team) return;
+  const btn = document.getElementById('blitzBtn');
+  btn.disabled = true; btn.textContent = '...';
+  try {{
+    const url = `/blitz?team=${{encodeURIComponent(team)}}`
+      + `&accounts=${{cnt}}&linger=${{lng}}`
+      + `&msg=${{encodeURIComponent(msg)}}&key={key}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (!d.ok) alert('خطأ: ' + (d.error || 'فشل'));
+  }} catch(e) {{ alert(e.message); }}
+  btn.disabled = false; btn.textContent = '🌍 ابدأ الانفجار العالمي';
+  refreshBlitz();
+}}
+
+async function stopBlitz() {{
+  await fetch('/stop-blitz?key={key}');
+  refreshBlitz();
+}}
+
 setInterval(refreshWatch, 3000);
-setInterval(refreshSpam, 3000);
-refreshWatch(); refreshSpam();
+setInterval(refreshSpam, 2500);
+setInterval(refreshBlitz, 1500);
+refreshWatch(); refreshSpam(); refreshBlitz();
 </script>
 """
     return _wrap("Admin", body)
@@ -1706,7 +2054,7 @@ refreshWatch(); refreshSpam();
 #  🚀  FASTAPI APP
 # ═══════════════════════════════════════════════════════════
 
-app = FastAPI(title="XORE FF Bot", version="3.5.0")
+app = FastAPI(title="XORE FF Bot", version="4.0.0")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1718,9 +2066,9 @@ def root(key: str = Query("")):
 
 @app.get("/health")
 def health():
-    ws = _watch_snapshot(); sp = _spam_snapshot()
+    ws = _watch_snapshot(); sp = _spam_snapshot(); bz = _blitz_snapshot()
     return {
-        "ok": True, "version": "3.5.0",
+        "ok": True, "version": "4.0.0",
         "hb_per_account": HB_PER_ACCOUNT,
         "max_session_seconds": MAX_SESSION_SECONDS,
         "welcome_enabled": WELCOME_ENABLED,
@@ -1730,6 +2078,9 @@ def health():
         "watch_sessions": ws["sessions"],
         "spam_active": sp["active"], "spam_team": sp["team"],
         "spam_cycles": sp["cycles"],
+        "blitz_active": bz["active"], "blitz_team": bz["team"],
+        "blitz_joined": bz["joined"], "blitz_total": bz["total"],
+        "speed_multiplier": 6,
     }
 
 
@@ -1746,7 +2097,7 @@ def check_live(key: str = Query("")):
     results = []
     with ThreadPoolExecutor(max_workers=min(len(accounts), LOGIN_POOL)) as pool:
         futures = {pool.submit(login_account, u, p): u for u, p in accounts}
-        for f in as_completed(futures, timeout=60):
+        for f in as_completed(futures, timeout=90):
             uid = futures[f]
             try:
                 r = f.result(timeout=LOGIN_TIMEOUT + 4)
@@ -1781,6 +2132,7 @@ def start_bot(
             "team": team, "results": [],
         })
     sessions = []; login_errors = []
+    # parallel login at max pool
     with ThreadPoolExecutor(max_workers=min(len(accounts), LOGIN_POOL)) as pool:
         futures = {uid: pool.submit(login_account, uid, pw)
                    for uid, pw in accounts}
@@ -1952,7 +2304,7 @@ def spam_bot(
     key: str = Query(""),
     rate: float = Query(SPAM_RATE),
     duration: int = Query(SPAM_DURATION),
-    accounts: int = Query(10),
+    accounts: int = Query(20),
 ):
     if not team.strip():
         raise HTTPException(400, "Team code required")
@@ -2058,6 +2410,128 @@ def spam_status():
     return {"ok": True, **snap}
 
 
+# ═══════════════════════════════════════════════════════════
+#  🌍  GLOBAL BLITZ ENDPOINTS
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/blitz")
+def blitz_bot(
+    team: str = Query(..., min_length=1, max_length=20),
+    key: str = Query(""),
+    accounts: int = Query(BLITZ_ACCOUNTS_MAX),
+    linger: float = Query(BLITZ_LINGER_S),
+    msg: str = Query(WELCOME_MSG),
+):
+    if not team.strip():
+        raise HTTPException(400, "Team code required")
+    if not is_admin(key):
+        return JSONResponse(status_code=403,
+                            content={"ok": False, "error": "invalid key"})
+    snap = _blitz_snapshot()
+    if snap["active"]:
+        return JSONResponse(status_code=409, content={
+            "ok": False, "error": "blitz already active",
+            "team": snap["team"],
+        })
+
+    accounts = max(10, min(int(accounts), BLITZ_ACCOUNTS_MAX, MAX_ACCOUNTS))
+    linger   = max(0.5, min(float(linger), 30.0))
+    msg      = (msg or WELCOME_MSG)[:120]
+
+    all_accs = get_accounts()
+    if not all_accs:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": "no accounts"})
+    sel = all_accs[:accounts]
+    random.shuffle(sel)
+
+    login_errors = []
+    sessions_data = []
+    # login all in parallel — max speed
+    with ThreadPoolExecutor(max_workers=min(len(sel), LOGIN_POOL)) as pool:
+        futures = {uid: pool.submit(login_account, uid, pw)
+                   for uid, pw in sel}
+        for uid, f in futures.items():
+            try:
+                r = f.result(timeout=LOGIN_TIMEOUT)
+            except Exception as e:
+                r = None
+                login_errors.append({"uid": uid, "error": str(e)})
+            if r: sessions_data.append(r)
+            else: login_errors.append({"uid": uid, "error": "login failed"})
+
+    if not sessions_data:
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": "no sessions",
+            "login_errors": login_errors,
+        })
+
+    global _BLITZ_STOP_EVENTS
+    stop_event = threading.Event()
+    _BLITZ_STOP_EVENTS.append(stop_event)
+
+    with _BLITZ_LOCK:
+        _BLITZ_STATE["active"] = True
+        _BLITZ_STATE["team"] = team
+        _BLITZ_STATE["started_at"] = time.time()
+        _BLITZ_STATE["accounts"] = len(sessions_data)
+        _BLITZ_STATE["joined"] = 0
+        _BLITZ_STATE["welcomed"] = 0
+        _BLITZ_STATE["exited"] = 0
+        _BLITZ_STATE["errors"] = 0
+        _BLITZ_STATE["events"] = []
+        _BLITZ_STATE["total"] = len(sessions_data)
+
+    def _worker(sd):
+        try:
+            _BlitzWorker(sd, team, stop_event, linger, msg)
+        except Exception:
+            _blitz_push("error", sd["uid"])
+
+    # fire all workers at once — the "blitz"
+    for sd in sessions_data:
+        threading.Thread(target=_worker, args=(sd,), daemon=True).start()
+
+    # auto-close state when linger + buffer passes
+    def _auto_finalize():
+        time.sleep(linger + 30)
+        with _BLITZ_LOCK:
+            _BLITZ_STATE["active"] = False
+    threading.Thread(target=_auto_finalize, daemon=True).start()
+
+    return {
+        "ok": True, "team": team,
+        "accounts": len(sessions_data),
+        "linger_s": linger,
+        "channel": BLITZ_CHANNEL,
+        "login_errors": login_errors,
+        "msg": msg,
+    }
+
+
+@app.get("/stop-blitz")
+def stop_blitz(key: str = Query("")):
+    if not is_admin(key):
+        return JSONResponse(status_code=403,
+                            content={"ok": False, "error": "invalid key"})
+    global _BLITZ_STOP_EVENTS
+    with _BLITZ_LOCK:
+        n = len(_BLITZ_STOP_EVENTS)
+        for ev in _BLITZ_STOP_EVENTS:
+            ev.set()
+        _BLITZ_STOP_EVENTS.clear()
+        _BLITZ_STATE["active"] = False
+    return {"ok": True, "stopped": n}
+
+
+@app.get("/blitz-status")
+def blitz_status():
+    snap = _blitz_snapshot()
+    if snap["active"]:
+        snap["uptime"] = round(time.time() - snap["started_at"], 1)
+    return {"ok": True, **snap}
+
+
 @app.post("/replace")
 async def replace_endpoint(request: Request):
     form = await request.form()
@@ -2097,9 +2571,10 @@ async def replace_endpoint(request: Request):
 
 @app.get("/api/status")
 def api_status():
-    live = get_live_status(); ws = _watch_snapshot(); sp = _spam_snapshot()
+    live = get_live_status(); ws = _watch_snapshot()
+    sp = _spam_snapshot(); bz = _blitz_snapshot()
     return {
-        "status": "ok", "version": "3.5.0",
+        "status": "ok", "version": "4.0.0",
         "accounts": len(get_accounts()),
         "max_accounts": MAX_ACCOUNTS,
         "hb_per_account": HB_PER_ACCOUNT,
@@ -2109,7 +2584,11 @@ def api_status():
         "watch_active": ws["active"],
         "spam_active": sp["active"],
         "spam_cycles": sp["cycles"],
+        "blitz_active": bz["active"],
+        "blitz_joined": bz["joined"],
+        "blitz_total": bz["total"],
         "release": "OB55", "region": "ME",
+        "speed_multiplier": 6,
     }
 
 
@@ -2120,8 +2599,10 @@ def api_status():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))
-    _log(f"XORE v3.5 starting on port {port}, "
-         f"HB={HB_PER_ACCOUNT}, welcome='{WELCOME_MSG}', "
-         f"channel={WELCOME_CHANNEL}, debug={XORE_DEBUG}")
+    _log(f"XORE v4.0 starting on port {port}, "
+         f"HB={HB_PER_ACCOUNT}, pool={LOGIN_POOL}, "
+         f"blitz_max={BLITZ_ACCOUNTS_MAX}, "
+         f"blitz_linger={BLITZ_LINGER_S}s, "
+         f"welcome='{WELCOME_MSG}', debug={XORE_DEBUG}")
     uvicorn.run(app, host="0.0.0.0", port=port,
                 log_level="info", access_log=False)
