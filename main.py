@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XORE FF BOT — v4.0 (FULL SINGLE FILE)
+XORE FF BOT — v4.1 (FULL SINGLE FILE)
 ======================================
-Speed 6x + 4HB parallel + Global Blitz (100 akun → welcome → exit 3s)
-+ Auto-Welcome + Join/Exit Spam + Skin/Weapon Sender + Live Tracker.
+Public  : Ghost 4HB ONLY (speed 6x)
+Admin   : Ghost + Global Blitz + Spam + Auto-Welcome + Live Check + Accounts
 """
 import asyncio
 import json
@@ -60,10 +60,9 @@ SPAM_RATE            = float(os.environ.get("SPAM_RATE", "0.15"))
 SPAM_DURATION        = int(os.environ.get("SPAM_DURATION", "120"))
 SPAM_ACCOUNTS_MAX    = int(os.environ.get("SPAM_ACCOUNTS_MAX", "100"))
 
-# Global Blitz
 BLITZ_ACCOUNTS_MAX   = int(os.environ.get("BLITZ_ACCOUNTS_MAX", "100"))
 BLITZ_LINGER_S       = float(os.environ.get("BLITZ_LINGER_S", "3.0"))
-BLITZ_CHANNEL        = int(os.environ.get("BLITZ_CHANNEL", "2"))  # 2=world/global
+BLITZ_CHANNEL        = int(os.environ.get("BLITZ_CHANNEL", "2"))
 
 XORE_DEBUG           = os.environ.get("XORE_DEBUG", "0") == "1"
 
@@ -130,7 +129,7 @@ _SPAM_STOP_EVENTS = []
 _BLITZ_STATE = {
     "active": False, "team": None, "started_at": 0,
     "accounts": 0, "joined": 0, "welcomed": 0, "exited": 0, "errors": 0,
-    "events": [], "current": 0, "total": 0,
+    "events": [], "total": 0,
 }
 _BLITZ_LOCK = threading.Lock()
 _BLITZ_STOP_EVENTS = []
@@ -463,31 +462,6 @@ def ExiT(key, iv):
     return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
 
 
-def Send_Emote(bot_uid, squad_code, emote_id, key, iv):
-    """Emote/gesture broadcast packet (opcode 102)."""
-    fields = {
-        1: 102, 2: {
-            1: int(bot_uid),
-            2: int(emote_id),
-            3: squad_code,
-            4: int(time.time()),
-        },
-    }
-    return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
-
-
-def Send_QuickChat(bot_uid, squad_code, qc_id, key, iv):
-    """Quick-chat (opcode 101) — pre-canned messages, faster than free text."""
-    fields = {
-        1: 101, 2: {
-            1: int(bot_uid),
-            2: int(qc_id),
-            3: squad_code,
-        },
-    }
-    return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
-
-
 # ═══════════════════════════════════════════════════════════
 #  🔑  LOGIN
 # ═══════════════════════════════════════════════════════════
@@ -733,7 +707,6 @@ def _TuneSock(s):
 
 
 def _fast_send(sock, pkt, retries=SEND_RETRIES):
-    """Send with retries + backoff; returns True on success."""
     for i in range(retries):
         try:
             sock.sendall(pkt)
@@ -865,7 +838,7 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                     if not members: continue
 
                     if (not watch_state["baseline_done"]
-                            and time.time() - watch_state["started"] 
+                            and time.time() - watch_state["started"]
                                 < WATCH_BASELINE_WAIT):
                         with watch_state["lock"]:
                             watch_state["known"].update(members)
@@ -891,10 +864,8 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                                 s.sendall(pkt)
                                 result["welcomed"] += 1
                                 _watch_push_event("welcome", uid=nu)
-                                _log(f"WELCOME sent to {nu}")
                             except Exception as ex:
                                 _watch_push_event("welcome_fail", uid=nu)
-                                _log(f"WELCOME FAIL to {nu}: {ex}")
 
                 except socket.timeout:
                     if time.time() - last_ping > WATCH_KEEPALIVE_PING:
@@ -1040,12 +1011,10 @@ def _SpamCycle(session_data, team_code, stop_event, rate, duration):
 
 
 # ═══════════════════════════════════════════════════════════
-#  🌍  GLOBAL BLITZ — 100 akun masuk → welcome → exit 3s
+#  🌍  GLOBAL BLITZ
 # ═══════════════════════════════════════════════════════════
 
-def _BlitzWorker(session_data, team_code, stop_event,
-                 linger_s, chat_msg):
-    """One account: login → join → welcome on world channel → wait linger → exit."""
+def _BlitzWorker(session_data, team_code, stop_event, linger_s, chat_msg):
     uid = session_data["uid"]
     jwt = session_data["jwt"]; ts = session_data["ts"]
     key = session_data["key"]; iv = session_data["iv"]
@@ -1065,7 +1034,6 @@ def _BlitzWorker(session_data, team_code, stop_event,
             if _fast_send(s, join_pkt):
                 break
 
-        # wait briefly for team/squad handshake
         s.settimeout(0.4)
         squad_code = None
         t0 = time.time()
@@ -1096,7 +1064,6 @@ def _BlitzWorker(session_data, team_code, stop_event,
 
         _blitz_push("joined", uid)
 
-        # welcome on world channel (global)
         try:
             gc = Send_GlobalChat(uid, chat_msg, squad_code or "0", key, iv)
             if _fast_send(s, gc):
@@ -1104,7 +1071,6 @@ def _BlitzWorker(session_data, team_code, stop_event,
         except Exception:
             pass
 
-        # linger for N seconds
         end_at = time.time() + max(0.5, linger_s)
         s.settimeout(0.4)
         while time.time() < end_at and not stop_event.is_set():
@@ -1115,7 +1081,6 @@ def _BlitzWorker(session_data, team_code, stop_event,
             except Exception:
                 break
 
-        # exit
         try:
             if _fast_send(s, ExiT(key, iv)):
                 _blitz_push("exit", uid)
@@ -1272,6 +1237,9 @@ footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
 .animate-in{animation:fadeIn .4s ease-out}
 .blitz{border-color:rgba(245,184,0,.5);
  background:linear-gradient(180deg,rgba(245,184,0,.06),transparent)}
+.admin-tag{display:inline-block;padding:3px 10px;background:linear-gradient(135deg,#8b5cf6,#ec4899);
+ color:#fff;border-radius:6px;font-size:10px;font-weight:900;letter-spacing:1px;
+ margin-right:8px}
 @media (max-width:600px){
  .container{padding:20px 14px 50px}
  .logo{font-size:38px;letter-spacing:8px}
@@ -1301,7 +1269,7 @@ def _wrap(title, body):
 {body}
 <footer>
   <div class="xore">XORE</div>
-  <div>Powered by XORE · Free Fire OB55 · ME · v4.0 · GLOBAL BLITZ</div>
+  <div>Powered by XORE · Free Fire OB55 · ME · v4.1</div>
 </footer>
 </div>
 </body>
@@ -1309,7 +1277,7 @@ def _wrap(title, body):
 
 
 # ═══════════════════════════════════════════════════════════
-#  📄  PUBLIC PAGE
+#  📄  PUBLIC PAGE — GHOST ONLY
 # ═══════════════════════════════════════════════════════════
 
 def render_public():
@@ -1317,12 +1285,11 @@ def render_public():
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
-  <div class="tagline">FF BOT · OB55 · ME · v4.0 GLOBAL BLITZ</div>
+  <div class="tagline">FF BOT · OB55 · ME · GHOST</div>
   <div class="status-bar">
     <div class="pill live"><span class="dot"></span> ONLINE</div>
-    <div class="pill">سرعة 6x</div>
+    <div class="pill">Speed 6x</div>
     <div class="pill">{HB_PER_ACCOUNT} اتصالات/حساب</div>
-    <div class="pill">🌍 Global Blitz</div>
   </div>
 </div>
 
@@ -1334,7 +1301,7 @@ def render_public():
 </div>
 
 <div class="card">
-  <h2>🚀 تشغيل البوت (4HB · Speed 6x)</h2>
+  <h2>👻 تشغيل Ghost (4HB · Speed 6x)</h2>
   <form id="startForm" onsubmit="startBot(event)">
     <div class="input-row" style="flex-direction:column;gap:14px">
       <input type="text" name="team" id="teamInput"
@@ -1342,7 +1309,7 @@ def render_public():
              required minlength="1" maxlength="20" autocomplete="off"
              style="text-align:center;font-size:18px;padding:20px;
                     letter-spacing:3px;font-weight:800">
-      <button type="submit" id="startBtn" class="btn btn-full">▶ تشغيل البوت</button>
+      <button type="submit" id="startBtn" class="btn btn-full">👻 بدء Ghost</button>
     </div>
   </form>
 
@@ -1362,80 +1329,9 @@ def render_public():
   <div id="resultWrap"></div>
 
   <div class="hint" style="text-align:center">
-    اكتب كود الفريق، اضغط <strong>تشغيل البوت</strong>.<br>
-    كل حساب يفتح <strong>{HB_PER_ACCOUNT} اتصالات متوازية</strong> — النتيجة أسفل الصفحة.
+    اكتب كود الفريق، اضغط <strong>بدء Ghost</strong>.<br>
+    كل حساب يفتح <strong>{HB_PER_ACCOUNT} اتصالات متوازية</strong> ويرسل JOIN + GHOST burst.
   </div>
-</div>
-
-<!-- ═══ GLOBAL BLITZ — 100 akun ═══ -->
-<div class="card blitz">
-  <h2 style="color:var(--warn)">🌍 Global Blitz — {BLITZ_ACCOUNTS_MAX} حساب</h2>
-  <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
-    <strong style="color:var(--warn)">{BLITZ_ACCOUNTS_MAX} حساب</strong> يدخلون <strong>العالمية</strong> عشوائياً
-    خلال ثواني، يرسلون رسالة ترحيب عالمية، ثم <strong>يخرجون بعد {BLITZ_LINGER_S} ثانية</strong>.
-    انفجار بصري وصوتي على الشات العالمي.
-  </p>
-  <div class="input-row" style="flex-direction:column;gap:12px">
-    <input type="text" id="pubBlitzTeam" placeholder="كود الفريق..."
-           minlength="1" maxlength="20" autocomplete="off"
-           style="text-align:center;font-size:16px;padding:16px;
-                  letter-spacing:3px;font-weight:800">
-    <input type="text" id="pubBlitzKey" placeholder="مفتاح الإدارة..."
-           autocomplete="off"
-           style="text-align:center;letter-spacing:2px;font-weight:700">
-    <div style="display:flex;gap:10px;flex-wrap:wrap">
-      <input type="text" id="pubBlitzCount" placeholder="عدد حسابات"
-             value="{BLITZ_ACCOUNTS_MAX}" style="max-width:140px;flex:1">
-      <input type="text" id="pubBlitzLinger" placeholder="مدة البقاء (s)"
-             value="{BLITZ_LINGER_S}" style="max-width:140px;flex:1">
-      <input type="text" id="pubBlitzMsg" placeholder="رسالة الترحيب"
-             value="{WELCOME_MSG}" style="flex:2;min-width:180px">
-    </div>
-    <div style="display:flex;gap:10px;flex-wrap:wrap">
-      <button onclick="pubStartBlitz()" id="pubBlitzBtn" class="gold" style="flex:1">
-        🌍 ابدأ الانفجار العالمي
-      </button>
-      <button onclick="pubStopBlitz()" style="flex:1;
-              background:linear-gradient(135deg,#6f6f88,#3f3f55)">
-        ⏹ إيقاف
-      </button>
-    </div>
-  </div>
-  <div id="pubBlitzStatus" style="margin-top:16px"></div>
-</div>
-
-<!-- ═══ SPAM ═══ -->
-<div class="card" style="border-color:rgba(244,63,94,.5);
-     background:linear-gradient(180deg,rgba(244,63,94,.06),transparent)">
-  <h2 style="color:var(--error)">💥 سبام دخول وخروج سريع</h2>
-  <div class="input-row" style="flex-direction:column;gap:12px">
-    <input type="text" id="pubKey" placeholder="مفتاح الإدارة (Admin Key)..."
-           autocomplete="off"
-           style="text-align:center;letter-spacing:2px;font-weight:700">
-    <input type="text" id="pubSpamTeam" placeholder="كود الفريق..."
-           minlength="1" maxlength="20" autocomplete="off"
-           style="text-align:center;font-size:16px;padding:16px;
-                  letter-spacing:3px;font-weight:800">
-    <div style="display:flex;gap:10px;flex-wrap:wrap">
-      <input type="text" id="pubSpamRate" placeholder="تأخير (s)"
-             value="{SPAM_RATE}" style="max-width:120px;flex:1">
-      <input type="text" id="pubSpamDur" placeholder="مدة (s)"
-             value="{SPAM_DURATION}" style="max-width:120px;flex:1">
-      <input type="text" id="pubSpamAccs" placeholder="حسابات"
-             value="20" style="max-width:120px;flex:1">
-    </div>
-    <div style="display:flex;gap:10px;flex-wrap:wrap">
-      <button onclick="pubStartSpam()" id="pubSpamBtn"
-              style="flex:1;background:linear-gradient(135deg,#f43f5e,#b91c1c)">
-        💥 بدء السبام
-      </button>
-      <button onclick="pubStopSpam()" style="flex:1;
-              background:linear-gradient(135deg,#6f6f88,#3f3f55)">
-        ⏹ إيقاف
-      </button>
-    </div>
-  </div>
-  <div id="pubSpamStatus" style="margin-top:16px"></div>
 </div>
 
 <script>
@@ -1488,7 +1384,7 @@ async function startBot(e) {{
       </div>`;
   }} finally {{
     btn.disabled = false;
-    btn.innerHTML = '▶ تشغيل البوت';
+    btn.innerHTML = '👻 بدء Ghost';
   }}
 }}
 
@@ -1550,132 +1446,6 @@ function renderResult(r) {{
     </div>`;
   wrap.scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
 }}
-
-async function pubRefreshSpam() {{
-  try {{
-    const r = await fetch('/spam-status');
-    const d = await r.json();
-    const el = document.getElementById('pubSpamStatus');
-    if (!d.active) {{
-      el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>';
-      return;
-    }}
-    el.innerHTML = `
-      <div class="result-box">
-        <div><div class="label">الفريق</div>
-          <div class="big purple" style="font-size:22px">${{d.team||'?'}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">حسابات</div><div class="big cyan">${{d.accounts}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">دورات</div><div class="big green">${{d.cycles}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">JOIN</div><div class="big green">${{d.joins}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">EXIT</div><div class="big red">${{d.exits}}</div></div>
-      </div>`;
-  }} catch(e) {{}}
-}}
-
-async function pubRefreshBlitz() {{
-  try {{
-    const r = await fetch('/blitz-status');
-    const d = await r.json();
-    const el = document.getElementById('pubBlitzStatus');
-    if (!d.active) {{
-      el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>';
-      return;
-    }}
-    const pct = d.total ? Math.floor((d.joined / d.total) * 100) : 0;
-    const evs = (d.events || []).slice(0, 10).map(e =>
-      `<tr><td class="mono">${{e.t}}</td><td>${{e.kind}}</td>
-       <td class="mono">${{e.uid || '-'}}</td></tr>`).join('')
-      || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">لا أحداث بعد...</td></tr>';
-    el.innerHTML = `
-      <div class="result-box">
-        <div><div class="label">دخلوا</div><div class="big green">${{d.joined}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">رحّبوا</div><div class="big gold">${{d.welcomed}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">خرجوا</div><div class="big red">${{d.exited}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">أخطاء</div><div class="big red" style="font-size:22px">${{d.errors}}</div></div>
-      </div>
-      <div class="progress-outer" style="margin-top:14px">
-        <div class="progress-inner" style="width:${{pct}}%"></div>
-      </div>
-      <div style="text-align:center;margin-top:8px;font-size:12px;color:var(--muted);font-weight:700">
-        ${{d.joined}}/${{d.total}} — ${{pct}}%
-      </div>
-      <table class="table" style="margin-top:14px">
-        <thead><tr><th>الوقت</th><th>الحدث</th><th>UID</th></tr></thead>
-        <tbody>${{evs}}</tbody>
-      </table>`;
-  }} catch(e) {{}}
-}}
-
-async function pubStartSpam() {{
-  const team = document.getElementById('pubSpamTeam').value.trim();
-  const key  = document.getElementById('pubKey').value.trim();
-  const rate = document.getElementById('pubSpamRate').value.trim() || '0.15';
-  const dur  = document.getElementById('pubSpamDur').value.trim() || '60';
-  const accs = document.getElementById('pubSpamAccs').value.trim() || '20';
-  if (!team) return alert('ادخل كود الفريق');
-  if (!key)  return alert('ادخل مفتاح الإدارة');
-  const btn = document.getElementById('pubSpamBtn');
-  btn.disabled = true; btn.textContent = '...';
-  try {{
-    const url = `/spam?team=${{encodeURIComponent(team)}}`
-      + `&rate=${{rate}}&duration=${{dur}}&accounts=${{accs}}`
-      + `&key=${{encodeURIComponent(key)}}`;
-    const r = await fetch(url);
-    const d = await r.json();
-    if (!d.ok) alert('خطأ: ' + (d.error || 'فشل'));
-  }} catch(e) {{ alert(e.message); }}
-  btn.disabled = false; btn.textContent = '💥 بدء السبام';
-  pubRefreshSpam();
-}}
-
-async function pubStopSpam() {{
-  const key = document.getElementById('pubKey').value.trim();
-  if (!key) return alert('ادخل مفتاح الإدارة');
-  await fetch('/stop-spam?key=' + encodeURIComponent(key));
-  pubRefreshSpam();
-}}
-
-async function pubStartBlitz() {{
-  const team = document.getElementById('pubBlitzTeam').value.trim();
-  const key  = document.getElementById('pubBlitzKey').value.trim();
-  const cnt  = document.getElementById('pubBlitzCount').value.trim() || '{BLITZ_ACCOUNTS_MAX}';
-  const lng  = document.getElementById('pubBlitzLinger').value.trim() || '{BLITZ_LINGER_S}';
-  const msg  = document.getElementById('pubBlitzMsg').value.trim() || '{WELCOME_MSG}';
-  if (!team) return alert('ادخل كود الفريق');
-  if (!key)  return alert('ادخل مفتاح الإدارة');
-  const btn = document.getElementById('pubBlitzBtn');
-  btn.disabled = true; btn.textContent = '...';
-  try {{
-    const url = `/blitz?team=${{encodeURIComponent(team)}}`
-      + `&accounts=${{cnt}}&linger=${{lng}}`
-      + `&msg=${{encodeURIComponent(msg)}}`
-      + `&key=${{encodeURIComponent(key)}}`;
-    const r = await fetch(url);
-    const d = await r.json();
-    if (!d.ok) alert('خطأ: ' + (d.error || 'فشل'));
-  }} catch(e) {{ alert(e.message); }}
-  btn.disabled = false; btn.textContent = '🌍 ابدأ الانفجار العالمي';
-  pubRefreshBlitz();
-}}
-
-async function pubStopBlitz() {{
-  const key = document.getElementById('pubBlitzKey').value.trim();
-  if (!key) return alert('ادخل مفتاح الإدارة');
-  await fetch('/stop-blitz?key=' + encodeURIComponent(key));
-  pubRefreshBlitz();
-}}
-
-setInterval(pubRefreshSpam, 2500);
-setInterval(pubRefreshBlitz, 1500);
-pubRefreshSpam();
-pubRefreshBlitz();
 </script>
 """
     return _wrap("XORE", body)
@@ -1719,7 +1489,7 @@ def render_admin(key):
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
-  <div class="tagline">ADMIN PANEL · v4.0 · GLOBAL BLITZ</div>
+  <div class="tagline"><span class="admin-tag">DEV</span> ADMIN PANEL · v4.1 · ALL FEATURES</div>
   <div class="status-bar">
     <div class="pill live"><span class="dot"></span> ADMIN</div>
     <div class="pill">إجمالي: {count}</div>
@@ -1740,12 +1510,12 @@ def render_admin(key):
     <div class="value cyan">{BLITZ_ACCOUNTS_MAX}</div></div>
 </div>
 
-<!-- GLOBAL BLITZ ADMIN -->
+<!-- GLOBAL BLITZ -->
 <div class="card blitz">
   <h2 style="color:var(--warn)">🌍 Global Blitz — انفجار عالمي</h2>
   <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
     <strong style="color:var(--warn)">{BLITZ_ACCOUNTS_MAX} حساب</strong> يدخلون <strong>العالمية</strong> عشوائياً،
-    يرسلون رسالة، ثم <strong>يخرجون بعد {BLITZ_LINGER_S} ثانية</strong>. سرعة كاملة.
+    يرسلون رسالة، ثم <strong>يخرجون بعد {BLITZ_LINGER_S} ثانية</strong>.
   </p>
   <div class="input-row">
     <input type="text" id="blitzTeam" placeholder="كود الفريق..."
@@ -1767,24 +1537,27 @@ def render_admin(key):
   <div id="blitzStatus" style="margin-top:16px"></div>
 </div>
 
+<!-- GHOST -->
+<div class="card">
+  <h2>👻 تشغيل Ghost (4HB · Speed 6x)</h2>
+  <form method="get" action="/start" target="_blank">
+    <input type="hidden" name="key" value="{key}">
+    <div class="input-row">
+      <input type="text" name="team" placeholder="كود الفريق..."
+             required minlength="1" maxlength="20" autocomplete="off">
+      <button type="submit">👻 START</button>
+    </div>
+  </form>
+</div>
+
+<!-- CHECK -->
 <div class="card">
   <h2>🔍 فحص الحسابات الحية</h2>
   <button onclick="checkAccounts()" id="checkBtn">▶ فحص الآن</button>
   <div id="liveResult">{live_html}</div>
 </div>
 
-<div class="card">
-  <h2>🚀 تشغيل البوت (4HB · Speed 6x)</h2>
-  <form method="get" action="/start" target="_blank">
-    <input type="hidden" name="key" value="{key}">
-    <div class="input-row">
-      <input type="text" name="team" placeholder="كود الفريق..."
-             required minlength="1" maxlength="20" autocomplete="off">
-      <button type="submit">▶ START</button>
-    </div>
-  </form>
-</div>
-
+<!-- WATCH -->
 <div class="card">
   <h2>👋 وضع الترحيب التلقائي</h2>
   <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
@@ -1796,7 +1569,7 @@ def render_admin(key):
     </span>
   </p>
   <div class="input-row">
-    <input type="text" id="watchTeam" placeholder="كود الفريق..." 
+    <input type="text" id="watchTeam" placeholder="كود الفريق..."
            minlength="1" maxlength="20" autocomplete="off">
     <button onclick="startWatch()" id="watchBtn" class="green">👋 بدء الترحيب</button>
     <button onclick="stopWatch()" class="danger">⏹ إيقاف</button>
@@ -1804,10 +1577,11 @@ def render_admin(key):
   <div id="watchStatus" style="margin-top:16px"></div>
 </div>
 
+<!-- SPAM -->
 <div class="card" style="border-color:rgba(244,63,94,.5)">
   <h2 style="color:var(--error)">💥 سبام دخول وخروج</h2>
   <div class="input-row">
-    <input type="text" id="spamTeam" placeholder="كود الفريق..." 
+    <input type="text" id="spamTeam" placeholder="كود الفريق..."
            minlength="1" maxlength="20" autocomplete="off">
     <input type="text" id="spamRate" placeholder="تأخير/cycle (s)"
            value="{SPAM_RATE}" style="max-width:140px">
@@ -1824,6 +1598,7 @@ def render_admin(key):
   <div id="spamStatus" style="margin-top:16px"></div>
 </div>
 
+<!-- ACCOUNTS -->
 <div class="card">
   <h2>➕ إدارة الحسابات</h2>
   <form method="post" action="/replace">
@@ -2054,7 +1829,7 @@ refreshWatch(); refreshSpam(); refreshBlitz();
 #  🚀  FASTAPI APP
 # ═══════════════════════════════════════════════════════════
 
-app = FastAPI(title="XORE FF Bot", version="4.0.0")
+app = FastAPI(title="XORE FF Bot", version="4.1.0")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2068,18 +1843,15 @@ def root(key: str = Query("")):
 def health():
     ws = _watch_snapshot(); sp = _spam_snapshot(); bz = _blitz_snapshot()
     return {
-        "ok": True, "version": "4.0.0",
+        "ok": True, "version": "4.1.0",
         "hb_per_account": HB_PER_ACCOUNT,
         "max_session_seconds": MAX_SESSION_SECONDS,
         "welcome_enabled": WELCOME_ENABLED,
         "welcome_msg": WELCOME_MSG,
         "welcome_channel": WELCOME_CHANNEL,
         "watch_active": ws["active"], "watch_team": ws["team"],
-        "watch_sessions": ws["sessions"],
         "spam_active": sp["active"], "spam_team": sp["team"],
-        "spam_cycles": sp["cycles"],
         "blitz_active": bz["active"], "blitz_team": bz["team"],
-        "blitz_joined": bz["joined"], "blitz_total": bz["total"],
         "speed_multiplier": 6,
     }
 
@@ -2132,7 +1904,6 @@ def start_bot(
             "team": team, "results": [],
         })
     sessions = []; login_errors = []
-    # parallel login at max pool
     with ThreadPoolExecutor(max_workers=min(len(accounts), LOGIN_POOL)) as pool:
         futures = {uid: pool.submit(login_account, uid, pw)
                    for uid, pw in accounts}
@@ -2447,7 +2218,6 @@ def blitz_bot(
 
     login_errors = []
     sessions_data = []
-    # login all in parallel — max speed
     with ThreadPoolExecutor(max_workers=min(len(sel), LOGIN_POOL)) as pool:
         futures = {uid: pool.submit(login_account, uid, pw)
                    for uid, pw in sel}
@@ -2488,11 +2258,9 @@ def blitz_bot(
         except Exception:
             _blitz_push("error", sd["uid"])
 
-    # fire all workers at once — the "blitz"
     for sd in sessions_data:
         threading.Thread(target=_worker, args=(sd,), daemon=True).start()
 
-    # auto-close state when linger + buffer passes
     def _auto_finalize():
         time.sleep(linger + 30)
         with _BLITZ_LOCK:
@@ -2574,7 +2342,7 @@ def api_status():
     live = get_live_status(); ws = _watch_snapshot()
     sp = _spam_snapshot(); bz = _blitz_snapshot()
     return {
-        "status": "ok", "version": "4.0.0",
+        "status": "ok", "version": "4.1.0",
         "accounts": len(get_accounts()),
         "max_accounts": MAX_ACCOUNTS,
         "hb_per_account": HB_PER_ACCOUNT,
@@ -2583,10 +2351,7 @@ def api_status():
         "dead": live["dead"] if live["checked"] else None,
         "watch_active": ws["active"],
         "spam_active": sp["active"],
-        "spam_cycles": sp["cycles"],
         "blitz_active": bz["active"],
-        "blitz_joined": bz["joined"],
-        "blitz_total": bz["total"],
         "release": "OB55", "region": "ME",
         "speed_multiplier": 6,
     }
@@ -2599,10 +2364,8 @@ def api_status():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))
-    _log(f"XORE v4.0 starting on port {port}, "
+    _log(f"XORE v4.1 starting port {port}, "
          f"HB={HB_PER_ACCOUNT}, pool={LOGIN_POOL}, "
-         f"blitz_max={BLITZ_ACCOUNTS_MAX}, "
-         f"blitz_linger={BLITZ_LINGER_S}s, "
-         f"welcome='{WELCOME_MSG}', debug={XORE_DEBUG}")
+         f"blitz_max={BLITZ_ACCOUNTS_MAX}, linger={BLITZ_LINGER_S}s")
     uvicorn.run(app, host="0.0.0.0", port=port,
                 log_level="info", access_log=False)
