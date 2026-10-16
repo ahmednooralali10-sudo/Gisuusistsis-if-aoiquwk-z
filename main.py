@@ -1,13 +1,13 @@
 """
 XORE FF BOT
 ===========
-Public landing + Admin dashboard (key-protected).
+Public landing + Admin dashboard (key-protected) with AJAX.
 
 Routes:
-    GET  /                       → landing (بسيط)
+    GET  /                       → landing (بسيط — AJAX)
     GET  /?key=<ADMIN_KEY>       → dashboard كامل
-    POST /check                  → فحص حي (admin)
-    GET  /start?team=<code>      → تشغيل (عام)
+    POST /check?key=<KEY>        → فحص حي (admin)
+    GET  /start?team=<code>      → تشغيل (يرجع JSON دائماً)
     POST /replace                → إدارة حسابات (admin)
     GET  /api/status             → حالة
 """
@@ -44,12 +44,8 @@ xV = b"6oyZDr22E3ychjM%"
 
 MAX_SESSION_SECONDS = 50
 MAX_ACCOUNTS = 500
-
-# ─── المفتاح الإداري ───
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "mahdixorepy12340")
 
-
-# ─── الحسابات (pw:uid) ───
 _DEFAULT_ACCOUNTS_RAW = """
 S7L8QUXNKDY8-S1X_TEAM:4555612051
 S7LFDZ8ZEEMF-S1X_TEAM:4555612941
@@ -360,7 +356,7 @@ def _set_live_status(**kwargs):
         _LIVE_STATUS.update(kwargs)
 
 
-def is_admin(key: str) -> bool:
+def is_admin(key):
     return key == ADMIN_KEY
 
 
@@ -970,7 +966,7 @@ def run_one_account(session_data, team_code, barrier, deadline):
 
 
 # ═══════════════════════════════════════════════════════════
-#  🎨  HTML  —  XORE Style
+#  🎨  CSS
 # ═══════════════════════════════════════════════════════════
 
 BASE_CSS = """
@@ -988,13 +984,10 @@ body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;
   background:
     radial-gradient(circle at 15% 5%, rgba(139,92,246,.14), transparent 45%),
     radial-gradient(circle at 85% 95%, rgba(6,182,212,.14), transparent 45%),
-    radial-gradient(circle at 50% 50%, rgba(236,72,153,.05), transparent 60%);
-}
+    radial-gradient(circle at 50% 50%, rgba(236,72,153,.05), transparent 60%)}
 a{color:var(--xore-2);text-decoration:none;transition:color .15s}
 a:hover{color:var(--xore-3)}
 .container{max-width:1180px;margin:0 auto;padding:32px 20px 80px}
-
-/* ── HEADER ── */
 .header{text-align:center;margin-bottom:40px;padding:40px 20px;position:relative}
 .header::after{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%);
   width:80px;height:2px;
@@ -1004,8 +997,6 @@ a:hover{color:var(--xore-3)}
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
   filter:drop-shadow(0 0 40px rgba(139,92,246,.45))}
 .tagline{color:var(--muted);font-size:12px;letter-spacing:6px;text-transform:uppercase;font-weight:700}
-
-/* ── STATUS ── */
 .status-bar{display:flex;align-items:center;justify-content:center;gap:12px;
   margin-top:22px;flex-wrap:wrap}
 .pill{display:inline-flex;align-items:center;gap:8px;padding:7px 16px;
@@ -1015,12 +1006,9 @@ a:hover{color:var(--xore-3)}
 .pill.live .dot{background:var(--success);box-shadow:0 0 12px var(--success);animation:pulse 2s infinite}
 .dot{width:8px;height:8px;border-radius:50%}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-
-/* ── HERO STAT (public) ── */
 .hero{display:flex;justify-content:center;margin:40px 0}
 .hero-stat{background:var(--card);border:1px solid var(--border);border-radius:24px;
-  padding:40px 60px;text-align:center;position:relative;overflow:hidden;
-  min-width:280px}
+  padding:40px 60px;text-align:center;position:relative;overflow:hidden;min-width:280px}
 .hero-stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
   background:linear-gradient(90deg,var(--xore-1),var(--xore-3),var(--xore-2))}
 .hero-stat .lbl{font-size:12px;color:var(--muted);text-transform:uppercase;
@@ -1029,8 +1017,6 @@ a:hover{color:var(--xore-3)}
   background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;
   filter:drop-shadow(0 0 30px rgba(139,92,246,.5))}
-
-/* ── STATS ── */
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
   gap:18px;margin-bottom:32px}
 .stat{background:var(--card);border:1px solid var(--border);border-radius:18px;
@@ -1047,16 +1033,12 @@ a:hover{color:var(--xore-3)}
   -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .stat .value.green{color:var(--success)}
 .stat .value.red{color:var(--error)}
-
-/* ── CARDS ── */
 .card{background:var(--card);border:1px solid var(--border);border-radius:20px;
   padding:26px;margin-bottom:22px;position:relative}
 .card h2{font-size:17px;font-weight:800;margin-bottom:20px;
   display:flex;align-items:center;gap:12px;letter-spacing:.5px}
 .card h2::before{content:'';width:5px;height:22px;border-radius:3px;
   background:linear-gradient(180deg,var(--xore-1),var(--xore-2))}
-
-/* ── INPUTS ── */
 .input-row{display:flex;gap:12px;flex-wrap:wrap}
 input[type=text],textarea{flex:1;background:var(--bg-2);
   border:1.5px solid var(--border);border-radius:12px;padding:15px 18px;
@@ -1066,27 +1048,21 @@ input[type=text]:focus,textarea:focus{border-color:var(--xore-1);
   box-shadow:0 0 0 4px rgba(139,92,246,.12)}
 textarea{resize:vertical;min-height:180px;font-family:'JetBrains Mono',monospace;
   font-size:12.5px;line-height:1.7}
-
-/* ── BUTTONS ── */
 button,.btn{display:inline-block;padding:15px 30px;border-radius:12px;
   font-weight:800;font-family:inherit;font-size:14px;letter-spacing:.8px;
   border:none;cursor:pointer;transition:all .18s;
   background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
-  color:#fff;box-shadow:0 8px 24px -8px rgba(139,92,246,.7);
-  text-align:center}
+  color:#fff;box-shadow:0 8px 24px -8px rgba(139,92,246,.7);text-align:center}
 button:hover,.btn:hover{transform:translateY(-2px);
   box-shadow:0 12px 32px -8px rgba(139,92,246,.9)}
 button:active,.btn:active{transform:translateY(0)}
 button.ghost,.btn.ghost{background:transparent;color:var(--xore-2);
   border:1.5px solid var(--xore-2);box-shadow:none}
-button.ghost:hover,.btn.ghost:hover{background:rgba(6,182,212,.08);
-  box-shadow:0 8px 24px -8px rgba(6,182,212,.5)}
+button.ghost:hover,.btn.ghost:hover{background:rgba(6,182,212,.08)}
 button.danger{background:linear-gradient(135deg,var(--error),#b91c1c)}
 button.green{background:linear-gradient(135deg,var(--success),#059669);color:#04140c}
 button:disabled{opacity:.5;cursor:not-allowed;transform:none}
 .btn-full{width:100%;padding:18px;font-size:16px;letter-spacing:2px}
-
-/* ── BADGES ── */
 .badge{display:inline-block;padding:5px 13px;border-radius:7px;font-size:11px;
   font-weight:800;letter-spacing:.6px;text-transform:uppercase}
 .badge.success{background:rgba(16,240,152,.14);color:var(--success);
@@ -1099,24 +1075,16 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none}
   border:1px solid rgba(6,182,212,.35)}
 .badge.purple{background:rgba(139,92,246,.14);color:var(--xore-1);
   border:1px solid rgba(139,92,246,.35)}
-
-/* ── TABLE ── */
 .table{width:100%;border-collapse:collapse;font-size:13px}
-.table th,.table td{text-align:left;padding:12px 14px;
-  border-bottom:1px solid var(--border)}
+.table th,.table td{text-align:left;padding:12px 14px;border-bottom:1px solid var(--border)}
 .table th{color:var(--muted);font-weight:800;text-transform:uppercase;
   font-size:11px;letter-spacing:1.2px;background:var(--bg-2)}
 .table tr:hover td{background:var(--card-2)}
 .mono{font-family:'JetBrains Mono',monospace;font-size:12.5px}
-
-/* ── HINT ── */
 .hint{color:var(--muted);font-size:12.5px;margin-top:14px;padding:14px 18px;
-  background:var(--bg-2);border-left:3px solid var(--xore-1);border-radius:8px;
-  line-height:1.7}
+  background:var(--bg-2);border-left:3px solid var(--xore-1);border-radius:8px;line-height:1.7}
 .hint code{background:#000;padding:3px 8px;border-radius:5px;
   color:var(--xore-2);font-size:12px;font-family:'JetBrains Mono',monospace}
-
-/* ── RESULT ── */
 .result-box{display:flex;align-items:center;gap:20px;flex-wrap:wrap;
   padding:22px;background:var(--bg-2);border-radius:16px;margin-top:16px;
   border:1px solid var(--border)}
@@ -1127,15 +1095,18 @@ button:disabled{opacity:.5;cursor:not-allowed;transform:none}
   -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .result-box .label{font-size:11px;color:var(--muted);
   text-transform:uppercase;letter-spacing:1.4px;font-weight:800;margin-bottom:6px}
-
-/* ── FOOTER ── */
 footer{margin-top:70px;padding-top:28px;border-top:1px solid var(--border);
   text-align:center;color:var(--muted);font-size:12.5px}
 footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
   background:linear-gradient(135deg,var(--xore-1),var(--xore-3),var(--xore-2));
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;
   display:inline-block;margin-bottom:8px}
-
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{display:inline-block;width:16px;height:16px;border:2px solid rgba(255,255,255,.3);
+  border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;
+  vertical-align:middle;margin-left:8px}
+@keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.animate-in{animation:fadeIn .4s ease-out}
 @media (max-width:600px){
   .container{padding:20px 14px 50px}
   .logo{font-size:38px;letter-spacing:8px}
@@ -1173,7 +1144,7 @@ def _wrap(title, body):
 
 
 # ═══════════════════════════════════════════════════════════
-#  📄  PUBLIC PAGE  (بسيط)
+#  📄  PUBLIC PAGE (AJAX)
 # ═══════════════════════════════════════════════════════════
 
 def render_public():
@@ -1197,27 +1168,183 @@ def render_public():
 
 <div class="card">
   <h2>🚀 تشغيل البوت</h2>
-  <form method="get" action="/start">
+  <form id="startForm" onsubmit="startBot(event)">
     <div class="input-row" style="flex-direction:column;gap:14px">
-      <input type="text" name="team"
+      <input type="text" name="team" id="teamInput"
              placeholder="أدخل كود الفريق (Team Code) هنا..."
-             required minlength="1" maxlength="20"
-             autocomplete="off"
-             style="text-align:center;font-size:18px;padding:20px;letter-spacing:3px;font-weight:800">
-      <button type="submit" class="btn btn-full">▶ تشغيل البوت</button>
+             required minlength="1" maxlength="20" autocomplete="off"
+             style="text-align:center;font-size:18px;padding:20px;
+                    letter-spacing:3px;font-weight:800">
+      <button type="submit" id="startBtn" class="btn btn-full">▶ تشغيل البوت</button>
     </div>
   </form>
+
+  <div id="progressWrap" style="display:none;margin-top:20px">
+    <div style="display:flex;justify-content:space-between;margin-bottom:8px;
+                font-size:12px;color:var(--muted);font-weight:700;letter-spacing:1px">
+      <span>⏳ يشتغل البوت...</span>
+      <span id="progressTime">0s</span>
+    </div>
+    <div style="height:8px;background:var(--bg-2);border-radius:99px;overflow:hidden;
+                border:1px solid var(--border)">
+      <div id="progressBar" style="height:100%;width:0%;
+           background:linear-gradient(90deg,var(--xore-1),var(--xore-3),var(--xore-2));
+           transition:width .3s;border-radius:99px"></div>
+    </div>
+    <div id="progressStage" style="text-align:center;margin-top:12px;font-size:13px;
+         color:var(--xore-2);font-weight:700;letter-spacing:1px">
+      🔑 تسجيل الدخول للحسابات...
+    </div>
+  </div>
+
+  <div id="resultWrap"></div>
+
   <div class="hint" style="text-align:center">
     اكتب كود الفريق اللي سوّيته في اللعبة، واضغط <strong>تشغيل البوت</strong>.<br>
-    البوت يدخل الفريق بكل الحسابات تلقائياً.
+    النتيجة تظهر <strong>أسفل الصفحة</strong> بدون تغيير الصفحة.
   </div>
 </div>
+
+<script>
+let timerInterval = null;
+let startTime = 0;
+
+function updateProgress() {{
+  const elapsed = Math.floor((Date.now() - startTime) / 1000);
+  document.getElementById('progressTime').textContent = elapsed + 's';
+  const pct = Math.min(95, (elapsed / 50) * 100);
+  document.getElementById('progressBar').style.width = pct + '%';
+  const stageEl = document.getElementById('progressStage');
+  if (elapsed < 10) {{
+    stageEl.textContent = '🔑 تسجيل دخول الحسابات...';
+  }} else if (elapsed < 20) {{
+    stageEl.textContent = '🌐 فتح اتصالات TCP...';
+  }} else if (elapsed < 30) {{
+    stageEl.textContent = '🎯 إرسال JOIN...';
+  }} else if (elapsed < 40) {{
+    stageEl.textContent = '👻 إرسال GHOST...';
+  }} else {{
+    stageEl.textContent = '🚪 EXIT وتنظيف...';
+  }}
+}}
+
+async function startBot(e) {{
+  e.preventDefault();
+  const team = document.getElementById('teamInput').value.trim();
+  if (!team) return;
+
+  const btn = document.getElementById('startBtn');
+  const progressWrap = document.getElementById('progressWrap');
+  const resultWrap = document.getElementById('resultWrap');
+
+  btn.disabled = true;
+  btn.innerHTML = 'يشتغل...<span class="spinner"></span>';
+  resultWrap.innerHTML = '';
+  progressWrap.style.display = 'block';
+  document.getElementById('progressBar').style.width = '0%';
+  document.getElementById('progressTime').textContent = '0s';
+
+  startTime = Date.now();
+  timerInterval = setInterval(updateProgress, 200);
+
+  try {{
+    const r = await fetch('/start?team=' + encodeURIComponent(team) + '&format=json');
+    const data = await r.json();
+
+    clearInterval(timerInterval);
+    document.getElementById('progressBar').style.width = '100%';
+    document.getElementById('progressStage').textContent = '✅ اكتمل';
+    setTimeout(() => {{ progressWrap.style.display = 'none'; }}, 800);
+
+    renderResult(data);
+  }} catch (err) {{
+    clearInterval(timerInterval);
+    progressWrap.style.display = 'none';
+    resultWrap.innerHTML = `
+      <div class="result-box animate-in" style="border-color:var(--error)">
+        <div class="label" style="color:var(--error)">خطأ: ${{err.message}}</div>
+      </div>`;
+  }} finally {{
+    btn.disabled = false;
+    btn.innerHTML = '▶ تشغيل البوت';
+  }}
+}}
+
+function renderResult(r) {{
+  const wrap = document.getElementById('resultWrap');
+  const isOk = r.status === 'completed' && r.accounts_logged > 0;
+  const logged = r.accounts_logged || 0;
+  const ran = r.accounts_ran || 0;
+  const elapsed = r.elapsed || 0;
+  const team = r.team || '?';
+
+  const results = (r.results || []).slice(0, 20);
+  const rowsHtml = results.map(x => {{
+    const chat = x.chat || '-';
+    const online = x.online || '-';
+    const cb = chat === 'success' ? 'success' : (chat.includes('timeout') || chat === 'no_team_data' ? 'warn' : 'error');
+    const ob = online === 'success' ? 'success' : (online.includes('timeout') || online === 'no_team_data' ? 'warn' : 'error');
+    return `<tr>
+      <td class="mono">${{x.uid || '?'}}</td>
+      <td><span class="badge ${{cb}}">${{chat}}</span></td>
+      <td><span class="badge ${{ob}}">${{online}}</span></td>
+      <td class="mono">${{x.total_sent || 0}}</td>
+    </tr>`;
+  }}).join('') || '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">لا نتائج</td></tr>';
+
+  const extra = (r.results || []).length > 20
+    ? `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:12px">… و ${{r.results.length - 20}} حساب إضافي</td></tr>`
+    : '';
+
+  const badge = isOk
+    ? '<span class="badge success">نجح</span>'
+    : (r.status === 'failed' ? '<span class="badge error">فشل</span>' : '<span class="badge warn">غير معروف</span>');
+
+  wrap.innerHTML = `
+    <div class="animate-in" style="margin-top:24px">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px;
+                  padding-bottom:16px;border-bottom:1px solid var(--border)">
+        ${{badge}}
+        <span class="badge purple">فريق: ${{team}}</span>
+        <span class="badge info">${{elapsed}}s</span>
+      </div>
+
+      <div class="stats" style="margin-bottom:20px">
+        <div class="stat">
+          <div class="label">حسابات دخلت</div>
+          <div class="value green">${{logged}}</div>
+        </div>
+        <div class="stat">
+          <div class="label">حسابات نفذت</div>
+          <div class="value purple">${{ran}}</div>
+        </div>
+        <div class="stat">
+          <div class="label">المدة</div>
+          <div class="value cyan">${{elapsed}}s</div>
+        </div>
+      </div>
+
+      <h3 style="font-size:14px;font-weight:800;margin-bottom:12px;
+                 letter-spacing:1px;color:var(--muted);text-transform:uppercase">
+        📊 تفاصيل الحسابات
+      </h3>
+      <div style="overflow-x:auto;border:1px solid var(--border);border-radius:12px">
+        <table class="table">
+          <thead><tr><th>UID</th><th>Chat</th><th>Online</th><th>Sent</th></tr></thead>
+          <tbody>${{rowsHtml}}${{extra}}</tbody>
+        </table>
+      </div>
+    </div>`;
+
+  wrap.scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
+}}
+</script>
 """
     return _wrap("XORE", body)
 
 
 # ═══════════════════════════════════════════════════════════
-#  📄  ADMIN PAGE  (كامل)
+#  📄  ADMIN PAGE
 # ═══════════════════════════════════════════════════════════
 
 def render_admin(key):
@@ -1239,11 +1366,9 @@ def render_admin(key):
           <div style="margin-right:auto"><span class="badge success">محدّث</span></div>
         </div>"""
     elif live["checking"]:
-        live_html = """<div class="result-box">
-          <div class="label">⏳ جاري الفحص...</div></div>"""
+        live_html = '<div class="result-box"><div class="label">⏳ جاري الفحص...</div></div>'
     else:
-        live_html = """<div class="result-box">
-          <div class="label">لم يتم الفحص بعد — اضغط الزر</div></div>"""
+        live_html = '<div class="result-box"><div class="label">لم يتم الفحص بعد</div></div>'
 
     body = f"""
 <div class="header">
@@ -1278,7 +1403,8 @@ def render_admin(key):
 
 <div class="card">
   <h2>🚀 تشغيل البوت</h2>
-  <form method="get" action="/start">
+  <form method="get" action="/start" target="_blank">
+    <input type="hidden" name="key" value="{key}">
     <div class="input-row">
       <input type="text" name="team" placeholder="كود الفريق..."
              required minlength="1" maxlength="20" autocomplete="off">
@@ -1348,99 +1474,15 @@ async function checkAccounts() {{
     return _wrap("Admin", body)
 
 
-def render_result(r, is_admin=False):
-    team = r.get("team", "?"); status = r.get("status", "unknown")
-    elapsed = r.get("elapsed", 0)
-    logged = r.get("accounts_logged", 0)
-    ran = r.get("accounts_ran", 0)
-    results = r.get("results", [])
-    login_errors = r.get("login_errors", [])
-
-    badge = ('<span class="badge success">COMPLETED</span>'
-             if status == "completed" and logged > 0
-             else ('<span class="badge error">FAILED</span>'
-                   if status == "failed"
-                   else '<span class="badge warn">UNKNOWN</span>'))
-
-    def sb(s):
-        if s == "success": return '<span class="badge success">OK</span>'
-        if s and s.startswith("timeout"): return f'<span class="badge warn">{s}</span>'
-        if s == "no_team_data": return '<span class="badge warn">NO DATA</span>'
-        if s == "error": return '<span class="badge error">ERR</span>'
-        return f'<span class="badge info">{s}</span>'
-
-    rows = "".join(
-        f'<tr><td class="mono">{x.get("uid","?")}</td>'
-        f'<td>{sb(x.get("chat"))}</td><td>{sb(x.get("online"))}</td>'
-        f'<td class="mono">{x.get("total_sent",0)}</td></tr>'
-        for x in results) or \
-        '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">لا نتائج</td></tr>'
-
-    errs_html = ""
-    if login_errors and is_admin:
-        errs = "".join(
-            f'<tr><td class="mono">{e.get("uid","?")}</td>'
-            f'<td style="color:var(--error)">{e.get("error","?")}</td></tr>'
-            for e in login_errors)
-        errs_html = f"""<div class="card"><h2>⚠️ أخطاء تسجيل الدخول</h2>
-        <table class="table"><thead><tr><th>UID</th><th>Error</th></tr></thead>
-        <tbody>{errs}</tbody></table></div>"""
-
-    raw_json_html = ""
-    if is_admin:
-        raw_json_html = f"""<div class="card"><h2>🔍 JSON خام</h2>
-        <pre style="background:#0a0a12;border:1px solid var(--border);border-radius:10px;
-          padding:18px;font-size:12px;max-height:340px;overflow:auto;color:var(--muted);
-          font-family:'JetBrains Mono',monospace">{json.dumps(r, indent=2, ensure_ascii=False)}</pre></div>"""
-
-    body = f"""
-<div class="header">
-  <div class="logo" style="font-size:40px;letter-spacing:10px">RESULT</div>
-  <div class="status-bar">
-    {badge}
-    <span class="badge purple">Team: {team}</span>
-    <span class="badge info">{elapsed}s</span>
-  </div>
-</div>
-
-<div class="stats">
-  <div class="stat"><div class="label">Logged</div>
-    <div class="value green">{logged}</div></div>
-  <div class="stat"><div class="label">Ran</div>
-    <div class="value purple">{ran}</div></div>
-  <div class="stat"><div class="label">Duration</div>
-    <div class="value cyan">{elapsed}s</div></div>
-</div>
-
-<div class="card">
-  <h2>📊 تفاصيل</h2>
-  <table class="table">
-    <thead><tr><th>UID</th><th>Chat</th><th>Online</th><th>Sent</th></tr></thead>
-    <tbody>{rows}</tbody>
-  </table>
-</div>
-
-{errs_html}
-{raw_json_html}
-
-<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:16px">
-  <a href="/" class="btn">← الرجوع</a>
-  <a href="/start?team={team}" class="btn ghost">🔄 إعادة المحاولة</a>
-</div>
-"""
-    return _wrap(f"Result · {team}", body)
-
-
 # ═══════════════════════════════════════════════════════════
 #  🚀  FASTAPI APP
 # ═══════════════════════════════════════════════════════════
 
-app = FastAPI(title="XORE FF Bot", version="3.0.0")
+app = FastAPI(title="XORE FF Bot", version="3.1.0")
 
 
 @app.get("/", response_class=HTMLResponse)
 def root(key: str = Query("")):
-    """الصفحة الرئيسية — عامة أو إدارية حسب المفتاح."""
     if key and is_admin(key):
         return render_admin(key)
     return render_public()
@@ -1448,7 +1490,6 @@ def root(key: str = Query("")):
 
 @app.post("/check")
 def check_live(key: str = Query("")):
-    """فحص حي — يحتاج مفتاح."""
     if not is_admin(key):
         return JSONResponse(status_code=403,
                             content={"ok": False, "error": "invalid key"})
@@ -1490,17 +1531,20 @@ def check_live(key: str = Query("")):
 def start_bot(
     team: str = Query(..., min_length=1, max_length=20),
     key: str = Query(""),
+    format: str = Query("json"),
 ):
-    """تشغيل البوت — عام."""
+    """يرجع JSON دائماً — الصفحة العامة تستخدم AJAX."""
     if not team.strip():
         raise HTTPException(400, "Team code required")
 
-    is_admin_user = is_admin(key)
     start_time = time.time()
     deadline = start_time + MAX_SESSION_SECONDS
     accounts = get_accounts()
     if not accounts:
-        raise HTTPException(400, "لا يوجد حسابات")
+        return JSONResponse(status_code=400, content={
+            "status": "failed", "reason": "no accounts",
+            "team": team, "results": [],
+        })
 
     sessions = []
     login_errors = []
@@ -1519,11 +1563,12 @@ def start_bot(
                 login_errors.append({"uid": uid, "error": "login failed"})
 
     if not sessions:
-        payload = {"status": "failed", "reason": "no sessions",
-                   "team": team, "elapsed": round(time.time() - start_time, 2),
-                   "login_errors": login_errors, "results": [],
-                   "accounts_logged": 0, "accounts_ran": 0}
-        return HTMLResponse(render_result(payload, is_admin_user), status_code=502)
+        return JSONResponse(status_code=502, content={
+            "status": "failed", "reason": "no sessions",
+            "team": team, "elapsed": round(time.time() - start_time, 2),
+            "login_errors": login_errors, "results": [],
+            "accounts_logged": 0, "accounts_ran": 0,
+        })
 
     barrier = threading.Barrier(len(sessions))
     results = []; threads = []
@@ -1547,7 +1592,7 @@ def start_bot(
         e["total_sent"] += r.get("sent", 0)
         if r.get("error"): e["errors"].append(f"{r['tag']}: {r['error']}")
 
-    payload = {
+    return {
         "status": "completed", "team": team,
         "elapsed": round(time.time() - start_time, 2),
         "accounts_logged": len(sessions),
@@ -1555,12 +1600,10 @@ def start_bot(
         "login_errors": login_errors,
         "results": list(by_account.values()),
     }
-    return HTMLResponse(render_result(payload, is_admin_user))
 
 
 @app.post("/replace")
 async def replace_endpoint(request: Request):
-    """إدارة الحسابات — يحتاج مفتاح."""
     form = await request.form()
     raw = form.get("raw", "") or ""
     mode = form.get("mode", "replace")
@@ -1572,9 +1615,9 @@ async def replace_endpoint(request: Request):
             <a href="/" class="btn">← الرجوع</a></div>"""), status_code=403)
 
     if not raw.strip():
-        return HTMLResponse(_wrap("Error", """
+        return HTMLResponse(_wrap("Error", f"""
             <div class="card"><h2 style="color:var(--error)">❌ لا يوجد بيانات</h2>
-            <a href="/?key=""" + key + """" class="btn">← الرجوع</a></div>"""))
+            <a href="/?key={key}" class="btn">← الرجوع</a></div>"""))
 
     if mode == "append":
         added = add_accounts(raw)
