@@ -1,16 +1,15 @@
 """
-FF Ghost Bot API — نسخة داشبورد
-================================
-Dashboard + API لبوت فري فاير — Vercel-ready.
+XORE FF BOT
+===========
+Dashboard + API لبوت فري فاير.
 
 Endpoints:
     GET  /                       → داشبورد
-    GET  /start?team=<code>      → تشغيل التسلسل (HTML)
-    GET  /start?team=<code>&format=json  → JSON خام
-    GET  /login?format=json      → فحص تسجيل الدخول
+    POST /check                  → فحص حسابات حية (يرجع عدد الشغالة)
+    GET  /start?team=<code>      → تشغيل التسلسل
     GET  /accounts               → عرض الحسابات
     POST /add                    → إضافة حسابات
-    GET  /api/status             → JSON للإحصائيات
+    GET  /api/status             → حالة الخدمة
 """
 import json
 import os
@@ -23,9 +22,9 @@ import urllib3
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import blackboxprotobuf
@@ -46,7 +45,6 @@ xV = b"6oyZDr22E3ychjM%"
 MAX_SESSION_SECONDS = 50
 MAX_ACCOUNTS = 500
 
-# ─── الحسابات (pw:uid) ───
 _DEFAULT_ACCOUNTS_RAW = """
 S7L8QUXNKDY8-S1X_TEAM:4555612051
 S7LFDZ8ZEEMF-S1X_TEAM:4555612941
@@ -314,6 +312,19 @@ _ACCOUNTS = _parse_accounts(
 )
 _ACCOUNTS_LOCK = threading.Lock()
 
+# حالة الفحص الحي
+_LIVE_STATUS = {
+    "checked": False,
+    "total": 0,
+    "alive": 0,
+    "dead": 0,
+    "checking": False,
+    "results": [],       # [{uid, ok, name, error}]
+    "started_at": 0,
+    "finished_at": 0,
+}
+_LIVE_LOCK = threading.Lock()
+
 
 def get_accounts():
     with _ACCOUNTS_LOCK:
@@ -336,6 +347,25 @@ def add_accounts(raw):
                 existing.add((u, p))
                 added += 1
         return added
+
+
+def replace_accounts(raw):
+    """استبدال كل الحسابات بقائمة جديدة."""
+    global _ACCOUNTS
+    new_list = _parse_accounts(raw)
+    with _ACCOUNTS_LOCK:
+        _ACCOUNTS = new_list[:MAX_ACCOUNTS]
+    return len(_ACCOUNTS)
+
+
+def get_live_status():
+    with _LIVE_LOCK:
+        return dict(_LIVE_STATUS)
+
+
+def _set_live_status(**kwargs):
+    with _LIVE_LOCK:
+        _LIVE_STATUS.update(kwargs)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -512,22 +542,17 @@ def DeCode_PackEt(input_text):
 
 def Join_Team(team_code, key, iv):
     sub = {
-        1: bytes.fromhex("01090a0b121619201d2729"),
-        2: 40,
-        3: bytes.fromhex("01090a0b121619201d2729"),
-        4: "w\\Z]", 6: 12,
+        1: bytes.fromhex("01090a0b121619201d2729"), 2: 40,
+        3: bytes.fromhex("01090a0b121619201d2729"), 4: "w\\Z]", 6: 12,
         7: bytes.fromhex("01090a0b121619201d2729"),
         8: "1.132.9", 9: 6, 10: 2,
         11: bytes.fromhex("01090a0b121619201d2729"),
     }
     main = {
-        1: 4,
-        2: {
+        1: 4, 2: {
             4: bytes.fromhex("01090a0b121619201d2729"),
-            5: str(team_code),
-            6: 6, 8: 1, 9: sub,
-            11: {1: "IDC1", 2: 99, 3: "ME"},
-            13: "ar",
+            5: str(team_code), 6: 6, 8: 1, 9: sub,
+            11: {1: "IDC1", 2: 99, 3: "ME"}, 13: "ar",
             16: bytes.fromhex("374f521955"),
             20: [
                 {1: 3, 2: 360}, {1: 4, 2: 391}, {1: 5, 2: 156},
@@ -541,13 +566,12 @@ def Join_Team(team_code, key, iv):
 
 def SendInv(bot_uid, uid, K, V):
     fields = {
-        1: 33,
-        2: {
+        1: 33, 2: {
             1: int(uid), 2: "ME", 3: 1, 4: 1, 6: "yyt", 7: 330,
             8: 1000, 9: 100, 10: "DZ", 12: 1, 13: int(uid), 16: 1,
             17: {2: 159, 4: "y[WW", 6: 11, 8: "1.118.1", 9: 3, 10: 1},
-            18: 306, 19: 18, 24: 902000306,
-            26: {}, 27: {1: 11, 2: int(bot_uid), 3: 999}, 28: {},
+            18: 306, 19: 18, 24: 902000306, 26: {},
+            27: {1: 11, 2: int(bot_uid), 3: 999}, 28: {},
             31: {1: 1, 2: 32768}, 32: 32768,
             34: {
                 1: int(bot_uid), 2: 8,
@@ -561,8 +585,7 @@ def SendInv(bot_uid, uid, K, V):
 
 def Send_GhosTs(uid, name, sq, key, iv, lang="en"):
     fields = {
-        1: 61,
-        2: {
+        1: 61, 2: {
             1: int(uid),
             2: {
                 1: int(uid), 2: 1159, 3: name, 5: 12, 6: 9999,
@@ -794,10 +817,9 @@ def login_account(acc_uid, acc_pass):
 # ═══════════════════════════════════════════════════════════
 
 def BuildAuthToken(uid, jwt_str, ts, key, iv, mode="online"):
-    ah = f"{int(uid):x}"
+    ah = f"{int(uid):x}".zfill(16)
     if len(ah) > 16:
         raise ValueError("uid hex too long")
-    ah = ah.zfill(16)
     enc = AES.new(key, AES.MODE_CBC, iv).encrypt(
         pad(jwt_str.encode(), 16)
     ).hex()
@@ -850,10 +872,10 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                 data = s.recv(65536)
                 if not data:
                     break
-                hex_data = data.hex()
-                if hex_data.startswith("0500") and 100 < len(hex_data) < 5000:
+                hx = data.hex()
+                if hx.startswith("0500") and 100 < len(hx) < 5000:
                     try:
-                        js = DeCode_PackEt(hex_data[10:])
+                        js = DeCode_PackEt(hx[10:])
                         if js:
                             packet = json.loads(js)
                             t_uid = (packet.get("5", {}).get("data", {})
@@ -865,8 +887,7 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                                 sq = (packet.get("5", {}).get("data", {})
                                             .get("31", {}).get("data"))
                             if t_uid and sq:
-                                target_uid = t_uid
-                                squad_code = sq
+                                target_uid = t_uid; squad_code = sq
                                 break
                     except Exception:
                         pass
@@ -907,12 +928,11 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
             result["status"] = "timeout_before_ghost"
             return result
 
-        ghost_pkt = Send_GhosTs(int(target_uid), "[C][B][FF00FF]YAKOUB XV",
-                                squad_code, key, iv)
+        ghost = Send_GhosTs(int(target_uid), "[C][B][FF00FF]XORE",
+                            squad_code, key, iv)
         for _ in range(3):
             try:
-                s.sendall(ghost_pkt)
-                result["sent"] += 1
+                s.sendall(ghost); result["sent"] += 1
             except Exception:
                 break
             time.sleep(0.01)
@@ -923,21 +943,18 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
             pass
         if time.time() < deadline:
             try:
-                s.sendall(ExiT(key, iv))
-                result["sent"] += 1
+                s.sendall(ExiT(key, iv)); result["sent"] += 1
             except Exception:
                 pass
 
         result["status"] = "success"
         return result
     except Exception as e:
-        result["status"] = "error"
-        result["error"] = str(e)
+        result["status"] = "error"; result["error"] = str(e)
         return result
     finally:
         try:
-            if s:
-                s.close()
+            if s: s.close()
         except Exception:
             pass
 
@@ -952,137 +969,203 @@ def run_one_account(session_data, team_code, barrier, deadline):
         target=lambda: results.append(
             _Session(session_data["ip"], session_data["port"], uid,
                      jwt, ts, key, iv, "online", "ChaT",
-                     team_code, barrier, deadline)),
-        daemon=True,
-    )
+                     team_code, barrier, deadline)), daemon=True)
     t2 = threading.Thread(
         target=lambda: results.append(
             _Session(session_data["ip2"], session_data["port2"], uid,
                      jwt, ts, key, iv, "chat", "OnLinE",
-                     team_code, barrier, deadline)),
-        daemon=True,
-    )
+                     team_code, barrier, deadline)), daemon=True)
     t1.start(); t2.start()
     remaining = max(1, deadline - time.time())
-    t1.join(timeout=remaining)
-    t2.join(timeout=remaining)
+    t1.join(timeout=remaining); t2.join(timeout=remaining)
     return results
 
 
 # ═══════════════════════════════════════════════════════════
-#  🎨  HTML
+#  🎨  HTML  (XORE Style)
 # ═══════════════════════════════════════════════════════════
 
 BASE_CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0a0a0f;--card:#14141c;--card-2:#1a1a24;--border:#2a2a3a;
---text:#e8e8f0;--muted:#7a7a8c;--accent:#ff2d6c;--accent-2:#00e5ff;
---success:#00ff88;--warn:#ffb800;--error:#ff4444}
+:root{
+  --bg:#06060a;--bg-2:#0d0d14;--card:#12121b;--card-2:#1a1a26;
+  --border:#25253a;--text:#eaeaf2;--muted:#6f6f88;
+  --xore-1:#8b5cf6;--xore-2:#06b6d4;--xore-3:#ec4899;
+  --success:#10f098;--warn:#f5b800;--error:#f43f5e;
+}
 html,body{background:var(--bg);color:var(--text);
-font-family:'JetBrains Mono','Cairo',system-ui,monospace;min-height:100vh;line-height:1.6}
-body::before{content:'';position:fixed;inset:0;
-background:radial-gradient(circle at 20% 10%,rgba(255,45,108,.08),transparent 40%),
-radial-gradient(circle at 80% 90%,rgba(0,229,255,.08),transparent 40%);
-pointer-events:none;z-index:-1}
-a{color:var(--accent-2);text-decoration:none}
-.container{max-width:1100px;margin:0 auto;padding:28px 20px 60px}
-header.top{display:flex;align-items:center;justify-content:space-between;
-padding-bottom:20px;border-bottom:1px solid var(--border);margin-bottom:28px;
-flex-wrap:wrap;gap:12px}
-.logo{font-size:22px;font-weight:800;letter-spacing:1px;
-background:linear-gradient(90deg,var(--accent),var(--accent-2));
--webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.logo::before{content:'◢ ';-webkit-text-fill-color:var(--accent)}
-.logo::after{content:' ◣';-webkit-text-fill-color:var(--accent-2)}
-.status-pill{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;
-border-radius:999px;background:var(--card-2);border:1px solid var(--border);font-size:13px}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--success);
-box-shadow:0 0 10px var(--success);animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
-gap:16px;margin-bottom:28px}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:14px;
-padding:18px;position:relative;overflow:hidden}
+  font-family:'Cairo','JetBrains Mono',system-ui,sans-serif;
+  min-height:100vh;line-height:1.65;-webkit-font-smoothing:antialiased}
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;
+  background:
+    radial-gradient(circle at 15% 5%, rgba(139,92,246,.14), transparent 45%),
+    radial-gradient(circle at 85% 95%, rgba(6,182,212,.14), transparent 45%),
+    radial-gradient(circle at 50% 50%, rgba(236,72,153,.05), transparent 60%);
+}
+a{color:var(--xore-2);text-decoration:none;transition:color .15s}
+a:hover{color:var(--xore-3)}
+
+.container{max-width:1180px;margin:0 auto;padding:32px 20px 80px}
+
+/* ─── HEADER ─── */
+.header{text-align:center;margin-bottom:40px;padding:32px 20px;
+  background:linear-gradient(180deg,rgba(139,92,246,.06),transparent);
+  border-radius:24px;position:relative;overflow:hidden}
+.header::before{content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);
+  width:60%;height:1px;background:linear-gradient(90deg,transparent,var(--xore-1),transparent)}
+.logo{font-size:52px;font-weight:900;letter-spacing:12px;margin-bottom:8px;
+  background:linear-gradient(135deg,var(--xore-1) 0%,var(--xore-3) 50%,var(--xore-2) 100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+  filter:drop-shadow(0 0 30px rgba(139,92,246,.4))}
+.tagline{color:var(--muted);font-size:13px;letter-spacing:4px;text-transform:uppercase;
+  margin-bottom:20px;font-weight:600}
+.divider{width:120px;height:2px;margin:0 auto;
+  background:linear-gradient(90deg,transparent,var(--xore-1),var(--xore-3),var(--xore-2),transparent)}
+
+.status-bar{display:flex;align-items:center;justify-content:center;gap:14px;
+  margin-top:24px;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:7px 16px;
+  border-radius:999px;background:var(--card);border:1px solid var(--border);
+  font-size:12px;font-weight:600;letter-spacing:.5px;color:var(--muted)}
+.pill.live{color:var(--success);border-color:rgba(16,240,152,.3)}
+.pill.live .dot{background:var(--success);box-shadow:0 0 12px var(--success);animation:pulse 2s infinite}
+.dot{width:8px;height:8px;border-radius:50%}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+/* ─── STATS ─── */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+  gap:18px;margin-bottom:32px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:18px;
+  padding:22px;position:relative;overflow:hidden;transition:transform .15s}
+.stat:hover{transform:translateY(-3px)}
 .stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
-background:linear-gradient(90deg,var(--accent),var(--accent-2))}
-.stat .label{font-size:12px;color:var(--muted);text-transform:uppercase;
-letter-spacing:1px;margin-bottom:8px}
-.stat .value{font-size:26px;font-weight:800}
-.stat .value.accent{color:var(--accent)}
-.stat .value.accent2{color:var(--accent-2)}
-.stat .value.success{color:var(--success)}
-.card{background:var(--card);border:1px solid var(--border);border-radius:16px;
-padding:22px;margin-bottom:20px}
-.card h2{font-size:16px;font-weight:700;margin-bottom:16px;
-display:flex;align-items:center;gap:10px}
-.card h2::before{content:'';width:4px;height:18px;
-background:linear-gradient(180deg,var(--accent),var(--accent-2));border-radius:2px}
-.input-row{display:flex;gap:10px;flex-wrap:wrap}
-input[type=text],textarea{flex:1;background:var(--card-2);
-border:1px solid var(--border);border-radius:10px;padding:13px 16px;
-color:var(--text);font-family:inherit;font-size:14px;outline:none;
-transition:border-color .15s,box-shadow .15s;min-width:200px}
-input[type=text]:focus,textarea:focus{border-color:var(--accent);
-box-shadow:0 0 0 3px rgba(255,45,108,.15)}
-textarea{resize:vertical;min-height:130px;font-size:13px}
-button{background:linear-gradient(135deg,var(--accent),#ff4d88);color:#fff;
-border:none;padding:13px 26px;border-radius:10px;font-weight:700;
-font-family:inherit;font-size:14px;cursor:pointer;letter-spacing:.5px;
-transition:transform .1s,box-shadow .15s;box-shadow:0 0 20px rgba(255,45,108,.35)}
-button:hover{transform:translateY(-1px)}
-button.ghost{background:transparent;color:var(--accent-2);
-border:1px solid var(--accent-2);box-shadow:none}
-.badge{display:inline-block;padding:4px 12px;border-radius:6px;font-size:12px;
-font-weight:700;letter-spacing:.5px;text-transform:uppercase}
-.badge.success{background:rgba(0,255,136,.12);color:var(--success);
-border:1px solid rgba(0,255,136,.3)}
-.badge.error{background:rgba(255,68,68,.12);color:var(--error);
-border:1px solid rgba(255,68,68,.3)}
-.badge.warn{background:rgba(255,184,0,.12);color:var(--warn);
-border:1px solid rgba(255,184,0,.3)}
-.badge.info{background:rgba(0,229,255,.12);color:var(--accent-2);
-border:1px solid rgba(0,229,255,.3)}
+  background:linear-gradient(90deg,var(--xore-1),var(--xore-3),var(--xore-2))}
+.stat .label{font-size:11px;color:var(--muted);text-transform:uppercase;
+  letter-spacing:1.5px;margin-bottom:10px;font-weight:700}
+.stat .value{font-size:32px;font-weight:900;line-height:1}
+.stat .value.purple{background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.stat .value.cyan{background:linear-gradient(135deg,var(--xore-2),var(--xore-1));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.stat .value.green{color:var(--success)}
+.stat .value.red{color:var(--error)}
+
+/* ─── CARDS ─── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:20px;
+  padding:26px;margin-bottom:22px;position:relative}
+.card h2{font-size:17px;font-weight:800;margin-bottom:20px;
+  display:flex;align-items:center;gap:12px;letter-spacing:.5px}
+.card h2::before{content:'';width:5px;height:22px;border-radius:3px;
+  background:linear-gradient(180deg,var(--xore-1),var(--xore-2))}
+
+/* ─── INPUTS ─── */
+.input-row{display:flex;gap:12px;flex-wrap:wrap}
+input[type=text],textarea{flex:1;background:var(--bg-2);
+  border:1.5px solid var(--border);border-radius:12px;padding:15px 18px;
+  color:var(--text);font-family:inherit;font-size:14px;outline:none;
+  transition:border-color .15s,box-shadow .15s;min-width:200px}
+input[type=text]:focus,textarea:focus{border-color:var(--xore-1);
+  box-shadow:0 0 0 4px rgba(139,92,246,.12)}
+textarea{resize:vertical;min-height:180px;font-family:'JetBrains Mono',monospace;
+  font-size:12.5px;line-height:1.7}
+
+/* ─── BUTTONS ─── */
+button,.btn{display:inline-block;padding:15px 30px;border-radius:12px;
+  font-weight:800;font-family:inherit;font-size:14px;letter-spacing:.8px;
+  border:none;cursor:pointer;transition:all .18s;
+  background:linear-gradient(135deg,var(--xore-1),var(--xore-3));
+  color:#fff;box-shadow:0 8px 24px -8px rgba(139,92,246,.7)}
+button:hover,.btn:hover{transform:translateY(-2px);
+  box-shadow:0 12px 32px -8px rgba(139,92,246,.9)}
+button:active,.btn:active{transform:translateY(0)}
+button.ghost,.btn.ghost{background:transparent;color:var(--xore-2);
+  border:1.5px solid var(--xore-2);box-shadow:none}
+button.ghost:hover,.btn.ghost:hover{background:rgba(6,182,212,.08);
+  box-shadow:0 8px 24px -8px rgba(6,182,212,.5)}
+button.danger{background:linear-gradient(135deg,var(--error),#b91c1c)}
+button.green{background:linear-gradient(135deg,var(--success),#059669);color:#04140c}
+button:disabled{opacity:.5;cursor:not-allowed;transform:none}
+
+/* ─── BADGES ─── */
+.badge{display:inline-block;padding:5px 13px;border-radius:7px;font-size:11px;
+  font-weight:800;letter-spacing:.6px;text-transform:uppercase}
+.badge.success{background:rgba(16,240,152,.14);color:var(--success);
+  border:1px solid rgba(16,240,152,.35)}
+.badge.error{background:rgba(244,63,94,.14);color:var(--error);
+  border:1px solid rgba(244,63,94,.35)}
+.badge.warn{background:rgba(245,184,0,.14);color:var(--warn);
+  border:1px solid rgba(245,184,0,.35)}
+.badge.info{background:rgba(6,182,212,.14);color:var(--xore-2);
+  border:1px solid rgba(6,182,212,.35)}
+.badge.purple{background:rgba(139,92,246,.14);color:var(--xore-1);
+  border:1px solid rgba(139,92,246,.35)}
+
+/* ─── TABLE ─── */
 .table{width:100%;border-collapse:collapse;font-size:13px}
-.table th,.table td{text-align:left;padding:10px 12px;
-border-bottom:1px solid var(--border)}
-.table th{color:var(--muted);font-weight:600;text-transform:uppercase;
-font-size:11px;letter-spacing:1px}
+.table th,.table td{text-align:left;padding:12px 14px;
+  border-bottom:1px solid var(--border)}
+.table th{color:var(--muted);font-weight:800;text-transform:uppercase;
+  font-size:11px;letter-spacing:1.2px;background:var(--bg-2)}
 .table tr:hover td{background:var(--card-2)}
-.mono{font-family:'JetBrains Mono',monospace}
-.log{background:#0d0d14;border:1px solid var(--border);border-radius:10px;
-padding:14px;font-size:12px;max-height:260px;overflow-y:auto;
-white-space:pre-wrap;word-break:break-all;color:var(--muted)}
-.hint{color:var(--muted);font-size:12px;margin-top:10px;padding:10px 14px;
-background:var(--card-2);border-left:3px solid var(--accent);border-radius:6px}
-.hint code{background:#000;padding:2px 6px;border-radius:4px;
-color:var(--accent-2);font-size:12px}
-footer{margin-top:60px;padding-top:20px;border-top:1px solid var(--border);
-color:var(--muted);font-size:12px;text-align:center}
-footer .cr{color:var(--accent);font-weight:700}
-@media (max-width:600px){.container{padding:16px 14px 40px}
-.stat .value{font-size:22px}.card{padding:16px}}
+.mono{font-family:'JetBrains Mono',monospace;font-size:12.5px}
+
+/* ─── HINT ─── */
+.hint{color:var(--muted);font-size:12.5px;margin-top:14px;padding:14px 18px;
+  background:var(--bg-2);border-left:3px solid var(--xore-1);border-radius:8px;
+  line-height:1.7}
+.hint code{background:#000;padding:3px 8px;border-radius:5px;
+  color:var(--xore-2);font-size:12px;font-family:'JetBrains Mono',monospace}
+
+/* ─── RESULT BOX ─── */
+.result-box{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:20px;background:var(--bg-2);border-radius:14px;margin-top:16px;
+  border:1px solid var(--border)}
+.result-box .big{font-size:36px;font-weight:900;line-height:1}
+.result-box .big.green{color:var(--success);
+  text-shadow:0 0 20px rgba(16,240,152,.4)}
+.result-box .big.red{color:var(--error);
+  text-shadow:0 0 20px rgba(244,63,94,.4)}
+.result-box .label{font-size:11px;color:var(--muted);
+  text-transform:uppercase;letter-spacing:1.4px;font-weight:800}
+
+/* ─── FOOTER ─── */
+footer{margin-top:70px;padding-top:28px;border-top:1px solid var(--border);
+  text-align:center;color:var(--muted);font-size:12.5px}
+footer .xore{font-size:15px;font-weight:900;letter-spacing:6px;
+  background:linear-gradient(135deg,var(--xore-1),var(--xore-3),var(--xore-2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  display:inline-block;margin-bottom:6px}
+
+@media (max-width:600px){
+  .container{padding:20px 14px 50px}
+  .logo{font-size:38px;letter-spacing:8px}
+  .stat .value{font-size:26px}
+  .card{padding:18px}
+  button,.btn{padding:13px 22px;font-size:13px}
+}
 """
 
 
-def _html_wrap(title, body):
+def _wrap(title, body):
     return f"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title} — FF Ghost Bot</title>
+<title>{title} — XORE</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&family=Cairo:wght@400;600;800&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;800;900&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
 <style>{BASE_CSS}</style>
 </head>
 <body>
 <div class="container">
-<header class="top">
-<div class="logo">FF GHOST BOT</div>
-<div class="status-pill"><span class="dot"></span> ONLINE</div>
-</header>
 {body}
-<footer>Powered by <span class="cr">ALPHA XK</span> · 6767 · Free Fire OB55</footer>
+<footer>
+  <div class="xore">XORE</div>
+  <div>Powered by XORE · Free Fire OB55 · ME</div>
+</footer>
 </div>
 </body>
 </html>"""
@@ -1091,188 +1174,250 @@ def _html_wrap(title, body):
 def render_dashboard():
     accs = get_accounts()
     count = len(accs)
+    live = get_live_status()
+
+    # عدّاد حي
+    if live["checked"] and not live["checking"]:
+        live_html = f"""
+        <div class="result-box">
+          <div>
+            <div class="label">حسابات شغّالة</div>
+            <div class="big green">{live["alive"]}</div>
+          </div>
+          <div style="width:1px;height:50px;background:var(--border)"></div>
+          <div>
+            <div class="label">حسابات معطّلة</div>
+            <div class="big red">{live["dead"]}</div>
+          </div>
+          <div style="width:1px;height:50px;background:var(--border)"></div>
+          <div>
+            <div class="label">الإجمالي</div>
+            <div class="big purple">{live["total"]}</div>
+          </div>
+          <div style="margin-right:auto">
+            <span class="badge success">محدّث</span>
+          </div>
+        </div>
+        """
+    elif live["checking"]:
+        live_html = """
+        <div class="result-box">
+          <div class="label">جاري الفحص...</div>
+          <div style="flex:1"><div class="big purple">⏳</div></div>
+        </div>
+        """
+    else:
+        live_html = """
+        <div class="result-box">
+          <div class="label">لم يتم الفحص بعد — اضغط "فحص الحسابات"</div>
+        </div>
+        """
 
     body = f"""
-<div class="grid">
-<div class="stat"><div class="label">Accounts</div><div class="value accent">{count} / {MAX_ACCOUNTS}</div></div>
-<div class="stat"><div class="label">Max Session</div><div class="value accent2">{MAX_SESSION_SECONDS}s</div></div>
-<div class="stat"><div class="label">Region</div><div class="value success">ME</div></div>
-<div class="stat"><div class="label">Release</div><div class="value">OB55</div></div>
+<div class="header">
+  <div class="logo">XORE</div>
+  <div class="tagline">FF BOT · OB55 · ME</div>
+  <div class="divider"></div>
+  <div class="status-bar">
+    <div class="pill live"><span class="dot"></span> ONLINE</div>
+    <div class="pill">إجمالي: {count} حساب</div>
+    <div class="pill">الحد: {MAX_ACCOUNTS}</div>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat">
+    <div class="label">الحسابات المحمّلة</div>
+    <div class="value purple">{count}</div>
+  </div>
+  <div class="stat">
+    <div class="label">حسابات شغّالة</div>
+    <div class="value green">{live["alive"] if live["checked"] else "—"}</div>
+  </div>
+  <div class="stat">
+    <div class="label">حسابات معطّلة</div>
+    <div class="value red">{live["dead"] if live["checked"] else "—"}</div>
+  </div>
+  <div class="stat">
+    <div class="label">المنطقة</div>
+    <div class="value cyan">ME</div>
+  </div>
 </div>
 
 <div class="card">
-<h2>🚀 تشغيل البوت</h2>
-<form method="get" action="/start">
-<div class="input-row">
-<input type="text" name="team" placeholder="أدخل كود الفريق..." required minlength="1" maxlength="20" autocomplete="off">
-<button type="submit">▶ START</button>
-<button type="submit" class="ghost" formaction="/login">🔑 Login Only</button>
-</div>
-</form>
-<div class="hint">صيغة الحسابات: <code>password:uid</code> — كل حساب في سطر.</div>
+  <h2>🔍 فحص الحسابات الحية</h2>
+  <p style="color:var(--muted);font-size:13.5px;margin-bottom:18px">
+    اضغط الزر عشان يتفحّص كل الحسابات ويسجّل دخولها — يعرض لك عدد الشغّالة والمعطّلة.
+  </p>
+  <button onclick="checkAccounts()" id="checkBtn">▶ فحص الحسابات الآن</button>
+  <div id="liveResult">{live_html}</div>
 </div>
 
 <div class="card">
-<h2>👥 الحسابات ({count})</h2>
-<table class="table">
-<thead><tr><th>#</th><th>UID</th><th>Password</th></tr></thead>
-<tbody>
-{"".join(
-    f'<tr><td class="mono">{i+1}</td><td class="mono">{u}</td>'
-    f'<td class="mono">{p[:8]}…{p[-6:] if len(p)>14 else ""}</td></tr>'
-    for i,(u,p) in enumerate(accs[:50])
-)}
-{f'<tr><td colspan="3" style="text-align:center;color:var(--muted)">… و {count-50} حساب إضافي</td></tr>' if count > 50 else ''}
-</tbody>
-</table>
+  <h2>🚀 تشغيل البوت</h2>
+  <form method="get" action="/start">
+    <div class="input-row">
+      <input type="text" name="team" placeholder="أدخل كود الفريق (Team Code)..."
+             required minlength="1" maxlength="20" autocomplete="off">
+      <button type="submit">▶ START</button>
+    </div>
+  </form>
+  <div class="hint">
+    اكتب كود الفريق اللي سوّيته في اللعبة، واضغط START.<br>
+    البوت يدخل الفريق بكل الحسابات.
+  </div>
 </div>
 
 <div class="card">
-<h2>➕ إضافة حسابات</h2>
-<form method="post" action="/add">
-<textarea name="raw" placeholder="password1:uid1&#10;password2:uid2&#10;..."></textarea>
-<div style="margin-top:12px"><button type="submit">➕ إضافة</button></div>
-</form>
-<div class="hint">الحد الأقصى: <code>{MAX_ACCOUNTS}</code>. يقبل أسطر أو فواصل أو <code>;</code>.</div>
+  <h2>➕ إضافة / استبدال الحسابات</h2>
+  <form method="post" action="/replace">
+    <textarea name="raw" id="accInput"
+placeholder="password1:uid1&#10;password2:uid2&#10;password3:uid3&#10;... (حتى 500 حساب)"></textarea>
+    <div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap">
+      <button type="submit" name="mode" value="replace" class="danger">🔄 استبدال كلي</button>
+      <button type="submit" name="mode" value="append" class="green">➕ إضافة للحالي</button>
+    </div>
+  </form>
+  <div class="hint">
+    الصيغة: <code>password:uid</code> — كل حساب في سطر.<br>
+    الحد الأقصى: <code>{MAX_ACCOUNTS}</code> حساب.
+  </div>
 </div>
 
 <div class="card">
-<h2>📋 API Endpoints</h2>
-<table class="table">
-<thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
-<tbody>
-<tr><td><span class="badge info">GET</span></td><td class="mono">/</td><td>Dashboard</td></tr>
-<tr><td><span class="badge success">GET</span></td><td class="mono">/start?team=XXX</td><td>Run (HTML)</td></tr>
-<tr><td><span class="badge success">GET</span></td><td class="mono">/start?team=XXX&format=json</td><td>Run (JSON)</td></tr>
-<tr><td><span class="badge warn">GET</span></td><td class="mono">/login</td><td>Login check</td></tr>
-<tr><td><span class="badge info">GET</span></td><td class="mono">/accounts</td><td>List accounts</td></tr>
-<tr><td><span class="badge error">POST</span></td><td class="mono">/add</td><td>Add accounts</td></tr>
-</tbody>
-</table>
+  <h2>👥 قائمة الحسابات ({count})</h2>
+  <table class="table">
+    <thead><tr><th style="width:50px">#</th><th>UID</th><th>Password</th></tr></thead>
+    <tbody>
+      {"".join(
+          f'<tr><td class="mono">{i+1}</td><td class="mono">{u}</td>'
+          f'<td class="mono">{p[:10]}…{p[-6:] if len(p)>16 else ""}</td></tr>'
+          for i,(u,p) in enumerate(accs[:50])
+      )}
+      {f'<tr><td colspan="3" style="text-align:center;color:var(--muted);padding:16px">… و {count-50} حساب إضافي</td></tr>' if count > 50 else ''}
+    </tbody>
+  </table>
 </div>
+
+<script>
+async function checkAccounts() {{
+  const btn = document.getElementById('checkBtn');
+  const out = document.getElementById('liveResult');
+  btn.disabled = true;
+  btn.textContent = '⏳ جاري الفحص...';
+  out.innerHTML = '<div class="result-box"><div class="label">⏳ يفحص الحسابات، انتظر...</div></div>';
+
+  try {{
+    const r = await fetch('/check', {{ method: 'POST' }});
+    const data = await r.json();
+    if (!data.ok) throw new Error(data.error || 'check failed');
+    out.innerHTML = `
+      <div class="result-box">
+        <div><div class="label">حسابات شغّالة</div><div class="big green">${{data.alive}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">حسابات معطّلة</div><div class="big red">${{data.dead}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">الإجمالي</div><div class="big purple">${{data.total}}</div></div>
+        <div style="margin-right:auto"><span class="badge success">محدّث</span></div>
+      </div>
+    `;
+  }} catch (e) {{
+    out.innerHTML = `<div class="result-box"><div class="label" style="color:var(--error)">خطأ: ${{e.message}}</div></div>`;
+  }} finally {{
+    btn.disabled = false;
+    btn.textContent = '▶ إعادة الفحص';
+  }}
+}}
+</script>
 """
-    return _html_wrap("Dashboard", body)
+    return _wrap("Dashboard", body)
 
 
 def render_result(r):
-    team = r.get("team", "?")
-    status = r.get("status", "unknown")
+    team = r.get("team", "?"); status = r.get("status", "unknown")
     elapsed = r.get("elapsed", 0)
     logged = r.get("accounts_logged", 0)
     ran = r.get("accounts_ran", 0)
     results = r.get("results", [])
     login_errors = r.get("login_errors", [])
 
-    if status == "completed" and logged > 0:
-        badge = '<span class="badge success">COMPLETED</span>'
-    elif status == "failed":
-        badge = '<span class="badge error">FAILED</span>'
-    else:
-        badge = '<span class="badge warn">UNKNOWN</span>'
+    badge = ('<span class="badge success">COMPLETED</span>'
+             if status == "completed" and logged > 0
+             else ('<span class="badge error">FAILED</span>'
+                   if status == "failed"
+                   else '<span class="badge warn">UNKNOWN</span>'))
 
-    def stat_badge(s):
-        if s == "success":
-            return '<span class="badge success">OK</span>'
-        if s and s.startswith("timeout"):
-            return f'<span class="badge warn">{s}</span>'
-        if s == "no_team_data":
-            return '<span class="badge warn">no_team_data</span>'
-        if s == "error":
-            return '<span class="badge error">ERR</span>'
+    def sb(s):
+        if s == "success": return '<span class="badge success">OK</span>'
+        if s and s.startswith("timeout"): return f'<span class="badge warn">{s}</span>'
+        if s == "no_team_data": return '<span class="badge warn">NO DATA</span>'
+        if s == "error": return '<span class="badge error">ERR</span>'
         return f'<span class="badge info">{s}</span>'
 
     rows = "".join(
         f'<tr><td class="mono">{x.get("uid","?")}</td>'
-        f'<td>{stat_badge(x.get("chat"))}</td>'
-        f'<td>{stat_badge(x.get("online"))}</td>'
+        f'<td>{sb(x.get("chat"))}</td><td>{sb(x.get("online"))}</td>'
         f'<td class="mono">{x.get("total_sent",0)}</td></tr>'
-        for x in results
-    ) or '<tr><td colspan="4" style="text-align:center;color:var(--muted)">لا نتائج</td></tr>'
+        for x in results) or \
+        '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">لا نتائج</td></tr>'
 
-    login_err_html = ""
+    errs_html = ""
     if login_errors:
         errs = "".join(
             f'<tr><td class="mono">{e.get("uid","?")}</td>'
             f'<td style="color:var(--error)">{e.get("error","?")}</td></tr>'
-            for e in login_errors
-        )
-        login_err_html = f"""
-<div class="card"><h2>⚠️ Login Errors</h2>
-<table class="table"><thead><tr><th>UID</th><th>Error</th></tr></thead>
-<tbody>{errs}</tbody></table></div>
-"""
+            for e in login_errors)
+        errs_html = f"""<div class="card"><h2>⚠️ أخطاء تسجيل الدخول</h2>
+        <table class="table"><thead><tr><th>UID</th><th>Error</th></tr></thead>
+        <tbody>{errs}</tbody></table></div>"""
 
     body = f"""
+<div class="header" style="padding:22px">
+  <div class="logo" style="font-size:34px;letter-spacing:8px">RESULT</div>
+  <div class="divider"></div>
+</div>
+
 <div class="card">
-<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
-{badge}
-<span class="badge info">Team: {team}</span>
-<span class="badge info">{elapsed}s</span>
-</div>
-<div class="grid" style="margin-bottom:0">
-<div class="stat"><div class="label">Logged</div><div class="value success">{logged}</div></div>
-<div class="stat"><div class="label">Ran</div><div class="value accent">{ran}</div></div>
-<div class="stat"><div class="label">Duration</div><div class="value accent2">{elapsed}s</div></div>
-</div>
-</div>
-
-<div class="card"><h2>📊 Results</h2>
-<table class="table">
-<thead><tr><th>UID</th><th>Chat</th><th>Online</th><th>Sent</th></tr></thead>
-<tbody>{rows}</tbody>
-</table>
+  <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px">
+    {badge}
+    <span class="badge purple">Team: {team}</span>
+    <span class="badge info">{elapsed}s</span>
+  </div>
+  <div class="stats" style="margin-bottom:0">
+    <div class="stat"><div class="label">Logged</div><div class="value green">{logged}</div></div>
+    <div class="stat"><div class="label">Ran</div><div class="value purple">{ran}</div></div>
+    <div class="stat"><div class="label">Duration</div><div class="value cyan">{elapsed}s</div></div>
+  </div>
 </div>
 
-{login_err_html}
-
-<div class="card"><h2>🔍 Raw JSON</h2>
-<div class="log">{json.dumps(r, indent=2, ensure_ascii=False)}</div>
+<div class="card">
+  <h2>📊 تفاصيل النتائج</h2>
+  <table class="table">
+    <thead><tr><th>UID</th><th>Chat</th><th>Online</th><th>Sent</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
 </div>
 
-<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
-<a href="/" style="padding:13px 26px;border-radius:10px;background:linear-gradient(135deg,var(--accent),#ff4d88);color:#fff;font-weight:700;display:inline-block">← Dashboard</a>
-<a href="/start?team={team}" style="padding:13px 26px;border-radius:10px;background:transparent;color:var(--accent-2);border:1px solid var(--accent-2);font-weight:700;display:inline-block">🔄 Retry</a>
+{errs_html}
+
+<div class="card">
+  <h2>🔍 JSON خام</h2>
+  <pre style="background:#0a0a12;border:1px solid var(--border);border-radius:10px;padding:18px;font-size:12px;max-height:340px;overflow:auto;color:var(--muted);font-family:'JetBrains Mono',monospace">{json.dumps(r, indent=2, ensure_ascii=False)}</pre>
 </div>
-"""
-    return _html_wrap(f"Result · {team}", body)
 
-
-def render_login(result):
-    total = result.get("total", 0)
-    ok = result.get("ok", 0)
-    failed = result.get("failed", 0)
-    results = result.get("results", [])
-
-    rows = "".join(
-        f'<tr><td class="mono">{i+1}</td>'
-        f'<td>{"<span class=badge success>OK</span>" if r.get("ok") else "<span class=badge error>FAIL</span>"}</td>'
-        f'<td class="mono">{r.get("uid") or "-"}</td>'
-        f'<td class="mono">{r.get("name") or "-"}</td></tr>'
-        for i, r in enumerate(results)
-    ) or '<tr><td colspan="4" style="text-align:center;color:var(--muted)">لا نتائج</td></tr>'
-
-    body = f"""
-<div class="grid">
-<div class="stat"><div class="label">Total</div><div class="value">{total}</div></div>
-<div class="stat"><div class="label">Success</div><div class="value success">{ok}</div></div>
-<div class="stat"><div class="label">Failed</div><div class="value" style="color:var(--error)">{failed}</div></div>
-</div>
-<div class="card"><h2>🔑 Login Status</h2>
-<table class="table">
-<thead><tr><th>#</th><th>Status</th><th>UID</th><th>Name</th></tr></thead>
-<tbody>{rows}</tbody></table></div>
-<div style="margin-top:10px">
-<a href="/" style="padding:13px 26px;border-radius:10px;background:linear-gradient(135deg,var(--accent),#ff4d88);color:#fff;font-weight:700;display:inline-block">← Dashboard</a>
+<div style="display:flex;gap:12px;flex-wrap:wrap">
+  <a href="/" class="btn">← الرجوع للداشبورد</a>
+  <a href="/start?team={team}" class="btn ghost">🔄 إعادة المحاولة</a>
 </div>
 """
-    return _html_wrap("Login Status", body)
+    return _wrap(f"Result · {team}", body)
 
 
 # ═══════════════════════════════════════════════════════════
 #  🚀  FASTAPI APP
 # ═══════════════════════════════════════════════════════════
 
-app = FastAPI(title="FF Ghost Bot", version="2.0.0")
+app = FastAPI(title="XORE FF Bot", version="3.0.0")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1280,28 +1425,51 @@ def root():
     return render_dashboard()
 
 
-@app.get("/login", response_class=HTMLResponse)
-def login_only(format: str = Query("html")):
+@app.post("/check")
+def check_live():
+    """فحص حي لكل الحسابات — يرجّع عدد الشغّالة."""
     accounts = get_accounts()
-    with ThreadPoolExecutor(max_workers=min(len(accounts), 15)) as pool:
-        futures = [pool.submit(login_account, u, p) for u, p in accounts]
-        results = []
-        for f in futures:
+    if not accounts:
+        return {"ok": False, "error": "لا يوجد حسابات"}
+
+    _set_live_status(
+        checking=True, checked=False,
+        total=len(accounts), started_at=time.time(),
+    )
+
+    results = []
+    max_workers = min(len(accounts), 20)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(login_account, u, p): u for u, p in accounts}
+        for f in as_completed(futures, timeout=40):
+            uid = futures[f]
             try:
                 r = f.result(timeout=25)
             except Exception:
                 r = None
             results.append({
+                "uid": uid,
                 "ok": r is not None,
-                "uid": r["uid"] if r else None,
                 "name": r["name"] if r else None,
+                "error": None if r else "login failed",
             })
-    ok_count = sum(1 for r in results if r["ok"])
-    payload = {"total": len(accounts), "ok": ok_count,
-               "failed": len(accounts) - ok_count, "results": results}
-    if format == "json":
-        return JSONResponse(payload)
-    return render_login(payload)
+
+    alive = sum(1 for r in results if r["ok"])
+    dead = len(results) - alive
+
+    _set_live_status(
+        checking=False, checked=True,
+        total=len(results), alive=alive, dead=dead,
+        results=results, finished_at=time.time(),
+    )
+
+    return {
+        "ok": True,
+        "total": len(results),
+        "alive": alive,
+        "dead": dead,
+        "results": results,
+    }
 
 
 @app.get("/start")
@@ -1314,7 +1482,6 @@ def start_bot(
 
     start_time = time.time()
     deadline = start_time + MAX_SESSION_SECONDS
-
     accounts = get_accounts()
     if not accounts:
         raise HTTPException(400, "لا يوجد حسابات")
@@ -1340,39 +1507,31 @@ def start_bot(
                    "team": team, "elapsed": round(time.time() - start_time, 2),
                    "login_errors": login_errors, "results": [],
                    "accounts_logged": 0, "accounts_ran": 0}
-        if format == "json":
-            return JSONResponse(status_code=502, content=payload)
-        return HTMLResponse(render_result(payload), status_code=502)
+        return (JSONResponse(status_code=502, content=payload)
+                if format == "json"
+                else HTMLResponse(render_result(payload), status_code=502))
 
     barrier = threading.Barrier(len(sessions))
-    results = []
-    threads = []
+    results = []; threads = []
     for s in sessions:
         t = threading.Thread(
-            target=lambda sdata=s: results.extend(
-                run_one_account(sdata, team, barrier, deadline)),
-            daemon=True,
-        )
-        threads.append(t)
-        t.start()
-
+            target=lambda sd=s: results.extend(
+                run_one_account(sd, team, barrier, deadline)),
+            daemon=True)
+        threads.append(t); t.start()
     for t in threads:
         t.join(timeout=max(0.1, deadline - time.time()))
 
     by_account = {}
     for r in results:
         uid = str(r.get("uid"))
-        entry = by_account.setdefault(uid, {
+        e = by_account.setdefault(uid, {
             "uid": uid, "chat": None, "online": None,
-            "total_sent": 0, "errors": [],
-        })
-        if r["tag"] == "ChaT":
-            entry["chat"] = r["status"]
-        else:
-            entry["online"] = r["status"]
-        entry["total_sent"] += r.get("sent", 0)
-        if r.get("error"):
-            entry["errors"].append(f"{r['tag']}: {r['error']}")
+            "total_sent": 0, "errors": []})
+        if r["tag"] == "ChaT": e["chat"] = r["status"]
+        else: e["online"] = r["status"]
+        e["total_sent"] += r.get("sent", 0)
+        if r.get("error"): e["errors"].append(f"{r['tag']}: {r['error']}")
 
     payload = {
         "status": "completed", "team": team,
@@ -1382,59 +1541,62 @@ def start_bot(
         "login_errors": login_errors,
         "results": list(by_account.values()),
     }
-
-    if format == "json":
-        return JSONResponse(payload)
-    return HTMLResponse(render_result(payload))
+    return (JSONResponse(payload) if format == "json"
+            else HTMLResponse(render_result(payload)))
 
 
 @app.get("/accounts")
 def list_accounts():
     accs = get_accounts()
-    return {
-        "count": len(accs), "max": MAX_ACCOUNTS,
-        "accounts": [
-            {"uid": u, "password_masked": p[:6] + "..." + p[-4:] if len(p) > 12 else "***"}
-            for u, p in accs
-        ],
-    }
+    return {"count": len(accs), "max": MAX_ACCOUNTS,
+            "accounts": [{"uid": u,
+                          "password_masked": p[:6] + "..." + p[-4:] if len(p) > 12 else "***"}
+                         for u, p in accs]}
 
 
-@app.post("/add")
-async def add_accounts_endpoint(request: Request):
-    raw = ""
-    ct = request.headers.get("content-type", "")
-    if "application/json" in ct:
-        try:
-            body = await request.json()
-            raw = body.get("raw", "") if isinstance(body, dict) else ""
-        except Exception:
-            raw = ""
-    else:
-        try:
-            form = await request.form()
-            raw = form.get("raw", "")
-        except Exception:
-            pass
-        if not raw:
-            try:
-                body = await request.body()
-                raw = body.decode("utf-8", errors="ignore")
-            except Exception:
-                raw = ""
+@app.post("/replace")
+async def replace_endpoint(request: Request):
+    """إضافة / استبدال الحسابات."""
+    form = await request.form()
+    raw = form.get("raw", "") or ""
+    mode = form.get("mode", "replace")
+
     if not raw.strip():
-        raise HTTPException(400, "No data")
-    added = add_accounts(raw)
-    return JSONResponse({"added": added, "total": len(get_accounts()),
-                         "max": MAX_ACCOUNTS})
+        return HTMLResponse(_wrap("Error", """
+            <div class="card"><h2 style="color:var(--error)">❌ لا يوجد بيانات</h2>
+            <a href="/" class="btn">← الرجوع</a></div>"""))
+
+    if mode == "append":
+        added = add_accounts(raw)
+        msg = f"تمت إضافة {added} حساب"
+    else:
+        n = replace_accounts(raw)
+        msg = f"تم استبدال الحسابات — الإجمالي {n} حساب"
+
+    return HTMLResponse(_wrap("Done", f"""
+        <div class="header" style="padding:22px">
+          <div class="logo" style="font-size:34px;letter-spacing:8px">DONE</div>
+          <div class="divider"></div>
+        </div>
+        <div class="card">
+          <h2>✅ نجح</h2>
+          <p style="font-size:16px;margin-bottom:20px">{msg}</p>
+          <div class="stats">
+            <div class="stat"><div class="label">الإجمالي الآن</div>
+              <div class="value purple">{len(get_accounts())}</div></div>
+          </div>
+          <div style="margin-top:20px"><a href="/" class="btn">← الرجوع للداشبورد</a></div>
+        </div>"""))
 
 
 @app.get("/api/status")
 def api_status():
+    live = get_live_status()
     return {
         "status": "ok",
         "accounts": len(get_accounts()),
         "max_accounts": MAX_ACCOUNTS,
-        "max_session_seconds": MAX_SESSION_SECONDS,
+        "alive": live["alive"] if live["checked"] else None,
+        "dead": live["dead"] if live["checked"] else None,
         "release": "OB55", "region": "ME",
     }
