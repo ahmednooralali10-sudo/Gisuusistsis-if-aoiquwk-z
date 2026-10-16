@@ -1,23 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XORE FF BOT — v3.4 (FULL)
-==========================
-4HB parallel + Auto-Welcome + Join/Exit Spam Toggle.
-
-Routes:
-    GET  /                       → landing
-    GET  /?key=<ADMIN_KEY>       → dashboard
-    POST /check?key=<KEY>        → فحص حي
-    GET  /start?team=<code>      → 4HB run (JSON)
-    GET  /watch?team=<code>      → keepalive + welcome
-    GET  /spam?team=<code>&...   → join/exit spam
-    GET  /stop-watch             → إيقاف watch
-    GET  /stop-spam              → إيقاف spam
-    GET  /watch-status           → حالة
-    GET  /spam-status            → حالة
-    POST /replace                → إدارة حسابات
-    GET  /api/status /health     → حالة
+XORE FF BOT — v3.5 (FULL SINGLE FILE)
+======================================
+4HB parallel + Auto-Welcome (opcode 100) + Join/Exit Spam toggle.
 """
 import json
 import os
@@ -62,13 +48,22 @@ LOGIN_POOL          = int(os.environ.get("LOGIN_POOL", "32"))
 
 WELCOME_MSG          = os.environ.get("WELCOME_MSG", "اهلا من مهدي")
 WELCOME_ENABLED      = os.environ.get("WELCOME_ENABLED", "1") == "1"
+WELCOME_CHANNEL      = int(os.environ.get("WELCOME_CHANNEL", "1"))
 WATCH_KEEPALIVE      = int(os.environ.get("WATCH_KEEPALIVE", "600"))
 WATCH_KEEPALIVE_PING = int(os.environ.get("WATCH_KEEPALIVE_PING", "18"))
 WATCH_BASELINE_WAIT  = float(os.environ.get("WATCH_BASELINE_WAIT", "3.0"))
 
-SPAM_RATE            = float(os.environ.get("SPAM_RATE", "0.15"))   # تأخير بين JOIN/EXIT
-SPAM_DURATION        = int(os.environ.get("SPAM_DURATION", "120"))  # ثانية
-SPAM_ACCOUNTS_MAX    = int(os.environ.get("SPAM_ACCOUNTS_MAX", "20"))  # سقف الحسابات المُستخدمة
+SPAM_RATE            = float(os.environ.get("SPAM_RATE", "0.15"))
+SPAM_DURATION        = int(os.environ.get("SPAM_DURATION", "120"))
+SPAM_ACCOUNTS_MAX    = int(os.environ.get("SPAM_ACCOUNTS_MAX", "20"))
+
+XORE_DEBUG           = os.environ.get("XORE_DEBUG", "0") == "1"
+
+
+def _log(*a):
+    if XORE_DEBUG:
+        print("[XORE]", *a, flush=True)
+
 
 _DEFAULT_ACCOUNTS_RAW = os.environ.get("FF_ACCOUNTS_RAW", "") or """
 S7L8QUXNKDY8-S1X_TEAM:4555612051
@@ -76,6 +71,11 @@ S7LFDZ8ZEEMF-S1X_TEAM:4555612941
 S7LYRBXKENCE-S1X_TEAM:4555613802
 S7LDK8QTXOX0-S1X_TEAM:4555613964
 S7LZFLTWZ3J7-S1X_TEAM:4555614387
+S7LEZNRDKML8-S1X_TEAM:4555614764
+S7LHR6RDFK17-S1X_TEAM:4555614870
+S7LXPOMEKAEI-S1X_TEAM:4555614971
+S7LJ2WHEYG3P-S1X_TEAM:4555615013
+S7LUP4A85QZR-S1X_TEAM:4555625755
 """
 
 
@@ -143,10 +143,10 @@ def _spam_snapshot():
 
 def _spam_push(kind, uid=None):
     with _SPAM_LOCK:
-        if kind == "join":   _SPAM_STATE["joins"] += 1
-        elif kind == "exit": _SPAM_STATE["exits"] += 1
-        elif kind == "cycle":_SPAM_STATE["cycles"] += 1
-        elif kind == "error":_SPAM_STATE["errors"] += 1
+        if kind == "join":    _SPAM_STATE["joins"] += 1
+        elif kind == "exit":  _SPAM_STATE["exits"] += 1
+        elif kind == "cycle": _SPAM_STATE["cycles"] += 1
+        elif kind == "error": _SPAM_STATE["errors"] += 1
         _SPAM_STATE["events"].insert(0, {
             "t": time.strftime("%H:%M:%S"),
             "kind": kind, "uid": uid,
@@ -410,14 +410,14 @@ def Send_GhosTs(uid, name, sq, key, iv, lang="en"):
     return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
 
 
-def Send_TeamChat(bot_uid, msg, squad_code, key, iv, lang="ar"):
+def Send_TeamChat(bot_uid, msg, squad_code, key, iv, channel=1):
     text = str(msg)[:120]
     fields = {
-        1: 61, 2: {
+        1: 100,
+        2: {
             1: int(bot_uid),
-            2: {1: int(bot_uid), 2: 1159, 3: text, 5: 12, 6: 9999,
-                7: 1, 8: {2: 1, 3: 1}, 9: 3, 10: lang},
-            3: squad_code,
+            2: text,
+            3: int(channel),
         },
     }
     return GeneRaTePk(str(CrEaTe_ProTo(fields).hex()), "0519", key, iv)
@@ -634,7 +634,7 @@ def login_account(acc_uid, acc_pass):
 
 
 # ═══════════════════════════════════════════════════════════
-#  🌐  TCP SESSION (v3.4)
+#  🌐  TCP SESSION
 # ═══════════════════════════════════════════════════════════
 
 def BuildAuthToken(uid, jwt_str, ts, key, iv, mode="online"):
@@ -775,7 +775,6 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                 break
             time.sleep(0.005)
 
-        # ── WATCH MODE ──
         if watch_state is not None and WELCOME_ENABLED:
             result["status"] = "watching"
             watch_deadline = time.time() + WATCH_KEEPALIVE
@@ -822,12 +821,17 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                                 is_new = True
                         if is_new:
                             try:
-                                s.sendall(Send_TeamChat(
-                                    uid, WELCOME_MSG, squad_code, key, iv))
+                                pkt = Send_TeamChat(
+                                    uid, WELCOME_MSG, squad_code,
+                                    key, iv, channel=WELCOME_CHANNEL)
+                                s.sendall(pkt)
                                 result["welcomed"] += 1
                                 _watch_push_event("welcome", uid=nu)
-                            except Exception:
-                                pass
+                                _log(f"WELCOME sent to {nu}, "
+                                     f"opcode=100, len={len(pkt)}B")
+                            except Exception as ex:
+                                _watch_push_event("welcome_fail", uid=nu)
+                                _log(f"WELCOME FAIL to {nu}: {ex}")
 
                 except socket.timeout:
                     if time.time() - last_ping > WATCH_KEEPALIVE_PING:
@@ -846,7 +850,6 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                 pass
             return result
 
-        # ── العادي: EXIT ──
         try:
             barrier.wait(timeout=max(0.5, deadline - time.time()))
         except Exception:
@@ -912,14 +915,10 @@ def run_one_account(session_data, team_code, barrier, deadline,
 
 
 # ═══════════════════════════════════════════════════════════
-#  💥  SPAM MODE — JOIN/EXIT rápida غير طبيعية
+#  💥  SPAM MODE
 # ═══════════════════════════════════════════════════════════
 
 def _SpamCycle(session_data, team_code, stop_event, rate, duration):
-    """
-    حلقة JOIN/EXIT سريعة على سوكيت واحد. تعيد استخدام auth token
-    الموجود. تكرر: JOIN × 3 → EXIT × 2 → انتظار rate → أعِد.
-    """
     uid = session_data["uid"]
     jwt = session_data["jwt"]; ts = session_data["ts"]
     key = session_data["key"]; iv = session_data["iv"]
@@ -938,14 +937,11 @@ def _SpamCycle(session_data, team_code, stop_event, rate, duration):
         join_pkt = Join_Team(team_code, key, iv)
         exit_pkt = ExiT(key, iv)
 
-        # دخول أولي للتحضير
-        s.sendall(join_pkt)
-        joins += 1
+        s.sendall(join_pkt); joins += 1
         _spam_push("join", uid)
 
         end_at = time.time() + duration
         while time.time() < end_at and not stop_event.is_set():
-            # JOIN burst
             for _ in range(3):
                 if stop_event.is_set(): break
                 try:
@@ -956,7 +952,6 @@ def _SpamCycle(session_data, team_code, stop_event, rate, duration):
 
             time.sleep(rate)
 
-            # EXIT burst
             for _ in range(2):
                 if stop_event.is_set(): break
                 try:
@@ -982,7 +977,7 @@ def _SpamCycle(session_data, team_code, stop_event, rate, duration):
 
 
 # ═══════════════════════════════════════════════════════════
-#  🎨  CSS (نفس v3.3 — مختصر للاختصار)
+#  🎨  CSS
 # ═══════════════════════════════════════════════════════════
 
 BASE_CSS = """
@@ -1142,7 +1137,7 @@ def _wrap(title, body):
 {body}
 <footer>
   <div class="xore">XORE</div>
-  <div>Powered by XORE · Free Fire OB55 · ME · v3.4</div>
+  <div>Powered by XORE · Free Fire OB55 · ME · v3.5</div>
 </footer>
 </div>
 </body>
@@ -1150,7 +1145,7 @@ def _wrap(title, body):
 
 
 # ═══════════════════════════════════════════════════════════
-#  📄  PUBLIC PAGE (AJAX + 4HB)
+#  📄  PUBLIC PAGE
 # ═══════════════════════════════════════════════════════════
 
 def render_public():
@@ -1174,7 +1169,7 @@ def render_public():
 </div>
 
 <div class="card">
-  <h2>🚀 تشغيل البوت</h2>
+  <h2>🚀 تشغيل البوت (4HB)</h2>
   <form id="startForm" onsubmit="startBot(event)">
     <div class="input-row" style="flex-direction:column;gap:14px">
       <input type="text" name="team" id="teamInput"
@@ -1210,6 +1205,45 @@ def render_public():
     اكتب كود الفريق اللي سوّيته في اللعبة، واضغط <strong>تشغيل البوت</strong>.<br>
     كل حساب يفتح <strong>{HB_PER_ACCOUNT} اتصالات متوازية</strong> — النتيجة أسفل الصفحة.
   </div>
+</div>
+
+<!-- ═══ SPAM PUBLIC CARD ═══ -->
+<div class="card" style="border-color:rgba(244,63,94,.5);
+     background:linear-gradient(180deg,rgba(244,63,94,.06),transparent)">
+  <h2 style="color:var(--error)">💥 سبام دخول وخروج سريع</h2>
+  <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
+    البوت يكرر <code style="background:#000;padding:2px 8px;border-radius:4px;
+    color:var(--xore-2)">JOIN × 3 → EXIT × 2</code> بمعدل سريع جداً
+    على غرفة الفريق. <strong style="color:var(--warn)">يحتاج مفتاح الإدارة.</strong>
+  </p>
+  <div class="input-row" style="flex-direction:column;gap:12px">
+    <input type="text" id="pubKey" placeholder="مفتاح الإدارة (Admin Key)..."
+           autocomplete="off"
+           style="text-align:center;letter-spacing:2px;font-weight:700">
+    <input type="text" id="pubSpamTeam" placeholder="كود الفريق..."
+           minlength="1" maxlength="20" autocomplete="off"
+           style="text-align:center;font-size:16px;padding:16px;
+                  letter-spacing:3px;font-weight:800">
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <input type="text" id="pubSpamRate" placeholder="تأخير (s)"
+             value="{SPAM_RATE}" style="max-width:120px;flex:1">
+      <input type="text" id="pubSpamDur" placeholder="مدة (s)"
+             value="{SPAM_DURATION}" style="max-width:120px;flex:1">
+      <input type="text" id="pubSpamAccs" placeholder="حسابات"
+             value="10" style="max-width:120px;flex:1">
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button onclick="pubStartSpam()" id="pubSpamBtn"
+              style="flex:1;background:linear-gradient(135deg,#f43f5e,#b91c1c)">
+        💥 بدء السبام
+      </button>
+      <button onclick="pubStopSpam()" style="flex:1;
+              background:linear-gradient(135deg,#6f6f88,#3f3f55)">
+        ⏹ إيقاف
+      </button>
+    </div>
+  </div>
+  <div id="pubSpamStatus" style="margin-top:16px"></div>
 </div>
 
 <script>
@@ -1324,13 +1358,70 @@ function renderResult(r) {{
     </div>`;
   wrap.scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
 }}
+
+async function pubRefreshSpam() {{
+  try {{
+    const r = await fetch('/spam-status');
+    const d = await r.json();
+    const el = document.getElementById('pubSpamStatus');
+    if (!d.active) {{
+      el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>';
+      return;
+    }}
+    el.innerHTML = `
+      <div class="result-box">
+        <div><div class="label">الفريق</div>
+          <div class="big purple" style="font-size:22px">${{d.team||'?'}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">حسابات</div><div class="big cyan">${{d.accounts}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">دورات</div><div class="big green">${{d.cycles}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">JOIN</div><div class="big green">${{d.joins}}</div></div>
+        <div style="width:1px;height:50px;background:var(--border)"></div>
+        <div><div class="label">EXIT</div><div class="big red">${{d.exits}}</div></div>
+      </div>`;
+  }} catch(e) {{}}
+}}
+
+async function pubStartSpam() {{
+  const team = document.getElementById('pubSpamTeam').value.trim();
+  const key  = document.getElementById('pubKey').value.trim();
+  const rate = document.getElementById('pubSpamRate').value.trim() || '0.15';
+  const dur  = document.getElementById('pubSpamDur').value.trim() || '60';
+  const accs = document.getElementById('pubSpamAccs').value.trim() || '10';
+  if (!team) return alert('ادخل كود الفريق');
+  if (!key)  return alert('ادخل مفتاح الإدارة');
+  const btn = document.getElementById('pubSpamBtn');
+  btn.disabled = true; btn.textContent = '...';
+  try {{
+    const url = `/spam?team=${{encodeURIComponent(team)}}`
+      + `&rate=${{rate}}&duration=${{dur}}&accounts=${{accs}}`
+      + `&key=${{encodeURIComponent(key)}}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (!d.ok) alert('خطأ: ' + (d.error || 'فشل'));
+  }} catch(e) {{ alert(e.message); }}
+  btn.disabled = false; btn.textContent = '💥 بدء السبام';
+  pubRefreshSpam();
+}}
+
+async function pubStopSpam() {{
+  const key = document.getElementById('pubKey').value.trim();
+  if (!key) return alert('ادخل مفتاح الإدارة');
+  await fetch('/stop-spam?key=' + encodeURIComponent(key));
+  pubRefreshSpam();
+}}
+
+setInterval(pubRefreshSpam, 3000);
+pubRefreshSpam();
 </script>
 """
     return _wrap("XORE", body)
 
 
 # ═══════════════════════════════════════════════════════════
-#  📄  ADMIN PAGE (watch + spam cards)
+#  📄  ADMIN PAGE
 # ═══════════════════════════════════════════════════════════
 
 def render_admin(key):
@@ -1367,7 +1458,7 @@ def render_admin(key):
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
-  <div class="tagline">ADMIN PANEL · v3.4</div>
+  <div class="tagline">ADMIN PANEL · v3.5</div>
   <div class="status-bar">
     <div class="pill live"><span class="dot"></span> ADMIN</div>
     <div class="pill">إجمالي: {count}</div>
@@ -1405,13 +1496,15 @@ def render_admin(key):
   </form>
 </div>
 
-<!-- ═══ WATCH MODE ═══ -->
 <div class="card">
   <h2>👋 وضع الترحيب التلقائي</h2>
   <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
     البوت يبقى متصل ويترحّب بكل عضو جديد:
     <code style="background:#000;padding:2px 8px;border-radius:4px;
           color:var(--xore-2)">{WELCOME_MSG}</code>
+    <span style="color:var(--muted);font-size:12px">
+      (قناة: {WELCOME_CHANNEL} — 1=فريق, 2=عالم, 3=سكواد)
+    </span>
   </p>
   <div class="input-row">
     <input type="text" id="watchTeam" placeholder="كود الفريق..." 
@@ -1422,12 +1515,11 @@ def render_admin(key):
   <div id="watchStatus" style="margin-top:16px"></div>
 </div>
 
-<!-- ═══ SPAM MODE ═══ -->
-<div class="card">
-  <h2>💥 سبام دخول وخروج (Join/Exit Spam)</h2>
+<div class="card" style="border-color:rgba(244,63,94,.5)">
+  <h2 style="color:var(--error)">💥 سبام دخول وخروج</h2>
   <p style="color:var(--muted);font-size:13.5px;margin-bottom:14px">
     البوت يكرر <code style="background:#000;padding:2px 8px;border-radius:4px;
-    color:var(--xore-2)">JOIN × 3 → EXIT × 2</code> بمعدل سريع جداً على غرفة الفريق.
+    color:var(--xore-2)">JOIN × 3 → EXIT × 2</code> بمعدل سريع جداً.
   </p>
   <div class="input-row">
     <input type="text" id="spamTeam" placeholder="كود الفريق..." 
@@ -1440,8 +1532,9 @@ def render_admin(key):
            value="{min(SPAM_ACCOUNTS_MAX, 10)}" style="max-width:140px">
   </div>
   <div style="margin-top:14px;display:flex;gap:12px;flex-wrap:wrap">
-    <button onclick="startSpam()" id="spamBtn" class="warn">💥 بدء السبام</button>
-    <button onclick="stopSpam()" class="danger">⏹ إيقاف السبام</button>
+    <button onclick="startSpam()" id="spamBtn" class="danger">💥 بدء السبام</button>
+    <button onclick="stopSpam()" style="background:linear-gradient(135deg,#6f6f88,#3f3f55)">
+      ⏹ إيقاف السبام</button>
   </div>
   <div id="spamStatus" style="margin-top:16px"></div>
 </div>
@@ -1457,9 +1550,7 @@ placeholder="password1:uid1&#10;password2:uid2&#10;... (حتى {MAX_ACCOUNTS})">
       <button type="submit" name="mode" value="append" class="green">➕ إضافة</button>
     </div>
   </form>
-  <div class="hint">
-    الصيغة: <code>password:uid</code> — سطر لكل حساب.
-  </div>
+  <div class="hint">الصيغة: <code>password:uid</code> — سطر لكل حساب.</div>
 </div>
 
 <div class="card">
@@ -1496,7 +1587,6 @@ async function checkAccounts() {{
   }}
 }}
 
-// ─── WATCH ───
 async function refreshWatch() {{
   try {{
     const r = await fetch('/watch-status');
@@ -1547,7 +1637,6 @@ async function stopWatch() {{
   refreshWatch();
 }}
 
-// ─── SPAM ───
 async function refreshSpam() {{
   try {{
     const r = await fetch('/spam-status');
@@ -1617,7 +1706,7 @@ refreshWatch(); refreshSpam();
 #  🚀  FASTAPI APP
 # ═══════════════════════════════════════════════════════════
 
-app = FastAPI(title="XORE FF Bot", version="3.4.0")
+app = FastAPI(title="XORE FF Bot", version="3.5.0")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1631,11 +1720,12 @@ def root(key: str = Query("")):
 def health():
     ws = _watch_snapshot(); sp = _spam_snapshot()
     return {
-        "ok": True, "version": "3.4.0",
+        "ok": True, "version": "3.5.0",
         "hb_per_account": HB_PER_ACCOUNT,
         "max_session_seconds": MAX_SESSION_SECONDS,
         "welcome_enabled": WELCOME_ENABLED,
         "welcome_msg": WELCOME_MSG,
+        "welcome_channel": WELCOME_CHANNEL,
         "watch_active": ws["active"], "watch_team": ws["team"],
         "watch_sessions": ws["sessions"],
         "spam_active": sp["active"], "spam_team": sp["team"],
@@ -1755,6 +1845,9 @@ def watch_bot(
 ):
     if not team.strip():
         raise HTTPException(400, "Team code required")
+    if not is_admin(key):
+        return JSONResponse(status_code=403,
+                            content={"ok": False, "error": "invalid key"})
     snap = _watch_snapshot()
     if snap["active"]:
         return JSONResponse(status_code=409, content={
@@ -1832,6 +1925,9 @@ def watch_bot(
 
 @app.get("/stop-watch")
 def stop_watch(key: str = Query("")):
+    if not is_admin(key):
+        return JSONResponse(status_code=403,
+                            content={"ok": False, "error": "invalid key"})
     global _WATCH_STOP_EVENTS
     with _WATCH_LOCK:
         n = len(_WATCH_STOP_EVENTS)
@@ -1850,7 +1946,6 @@ def watch_status():
     return {"ok": True, **snap, "welcome_msg": WELCOME_MSG}
 
 
-# ─── SPAM ENDPOINTS ───
 @app.get("/spam")
 def spam_bot(
     team: str = Query(..., min_length=1, max_length=20),
@@ -1859,11 +1954,11 @@ def spam_bot(
     duration: int = Query(SPAM_DURATION),
     accounts: int = Query(10),
 ):
-    """
-    يبدأ وضع السبام: JOIN/EXIT سريع جداً. يعمل على N حساب كحد أقصى.
-    """
     if not team.strip():
         raise HTTPException(400, "Team code required")
+    if not is_admin(key):
+        return JSONResponse(status_code=403,
+                            content={"ok": False, "error": "invalid key"})
     snap = _spam_snapshot()
     if snap["active"]:
         return JSONResponse(status_code=409, content={
@@ -1871,8 +1966,8 @@ def spam_bot(
             "team": snap["team"],
         })
 
-    rate = max(0.02, min(rate, 5.0))           # بين 20ms و 5s
-    duration = max(5, min(duration, 1800))     # بين 5s و 30 دقيقة
+    rate = max(0.02, min(rate, 5.0))
+    duration = max(5, min(duration, 1800))
     accounts = max(1, min(accounts, SPAM_ACCOUNTS_MAX))
 
     all_accs = get_accounts()
@@ -1925,7 +2020,6 @@ def spam_bot(
         _SPAM_STATE["errors"] = 0
         _SPAM_STATE["events"] = []
 
-    # auto-stop بعد duration
     def _auto_stop():
         time.sleep(duration + 2)
         stop_event.set()
@@ -1943,6 +2037,9 @@ def spam_bot(
 
 @app.get("/stop-spam")
 def stop_spam(key: str = Query("")):
+    if not is_admin(key):
+        return JSONResponse(status_code=403,
+                            content={"ok": False, "error": "invalid key"})
     global _SPAM_STOP_EVENTS
     with _SPAM_LOCK:
         n = len(_SPAM_STOP_EVENTS)
@@ -2002,7 +2099,7 @@ async def replace_endpoint(request: Request):
 def api_status():
     live = get_live_status(); ws = _watch_snapshot(); sp = _spam_snapshot()
     return {
-        "status": "ok", "version": "3.4.0",
+        "status": "ok", "version": "3.5.0",
         "accounts": len(get_accounts()),
         "max_accounts": MAX_ACCOUNTS,
         "hb_per_account": HB_PER_ACCOUNT,
@@ -2023,5 +2120,8 @@ def api_status():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8000"))
+    _log(f"XORE v3.5 starting on port {port}, "
+         f"HB={HB_PER_ACCOUNT}, welcome='{WELCOME_MSG}', "
+         f"channel={WELCOME_CHANNEL}, debug={XORE_DEBUG}")
     uvicorn.run(app, host="0.0.0.0", port=port,
                 log_level="info", access_log=False)
