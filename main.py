@@ -1,32 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XORE FF BOT — v5.1 (FULL SINGLE FILE)
+XORE FF BOT — v5.2 (FULL SINGLE FILE)
 ======================================
 Public  : Ghost 4HB (Speed 6x)
-Admin   : Ghost + Blitz + Spam + Watch + Accounts CRUD (AJAX) + Logs + Stats
+Admin   : Ghost + Blitz + Spam + Watch + Room + Accounts CRUD + Logs + Stats
 
-v5.1 FIXES (Welcome Message Delivery):
-  [BUG 1] watch_worker deadline كان +60s فقط — الآن +WATCH_KEEPALIVE+30
-  [BUG 2] _extract_member_uids قوي: يتعامل مع int / str / bytes / nested
-  [BUG 3] welcome channel fallback: يجرب [1, 6, 8] تلقائياً
-  [BUG 4] logging تفصيلي داخل watch loop (pkts / uid_hits / welcomes)
-  [NEW]   /watch-debug — ring buffer لآخر 100 packet مستلمة
-  [NEW]   /watch-test-welcome — اختبار 4 قنوات على uid معين
-  [NEW]   _dump_packet() داخلي لكل packet مستلم
-
-v5.0 (base):
-  - Account Manager AJAX (no page reload)
-  - Batch select + bulk enable/disable/delete/test
-  - Sort + pagination + live search + filters
-  - Alias + Note per account
-  - Password reveal toggle
-  - Export TXT / CSV / JSON
-  - Live stats polling + running modules indicator
-  - Session history (last 50)
-  - Toast notifications + optional sound
-  - Dark / Light theme toggle
-  - Draft autosave (localStorage)
+v5.2 NEW:
+  [ROOM] Custom Room Join Mode
+    - /join-room endpoint (mass join room by Room ID)
+    - /stop-room, /room-status
+    - UI card 🚪 دخول روم مخصص
+    - Module indicator
+    - Multiple retries per account + parallel workers
 """
 import csv
 import io
@@ -77,7 +63,7 @@ SEND_RETRIES        = int(os.environ.get("SEND_RETRIES", "5"))
 WELCOME_MSG          = os.environ.get("WELCOME_MSG", "اهلا من مهدي")
 WELCOME_ENABLED      = os.environ.get("WELCOME_ENABLED", "1") == "1"
 WELCOME_CHANNEL      = int(os.environ.get("WELCOME_CHANNEL", "1"))
-WELCOME_CHANNELS_TRY = [WELCOME_CHANNEL, 6, 8, 1]  # fallback order
+WELCOME_CHANNELS_TRY = [WELCOME_CHANNEL, 6, 8, 1]
 WATCH_KEEPALIVE      = int(os.environ.get("WATCH_KEEPALIVE", "600"))
 WATCH_KEEPALIVE_PING = int(os.environ.get("WATCH_KEEPALIVE_PING", "18"))
 WATCH_BASELINE_WAIT  = float(os.environ.get("WATCH_BASELINE_WAIT", "3.0"))
@@ -89,6 +75,12 @@ SPAM_ACCOUNTS_MAX    = int(os.environ.get("SPAM_ACCOUNTS_MAX", "100"))
 BLITZ_ACCOUNTS_MAX   = int(os.environ.get("BLITZ_ACCOUNTS_MAX", "100"))
 BLITZ_LINGER_S       = float(os.environ.get("BLITZ_LINGER_S", "3.0"))
 BLITZ_CHANNEL        = int(os.environ.get("BLITZ_CHANNEL", "2"))
+
+# ═══ ROOM (جديد v5.2) ═══
+ROOM_ID              = os.environ.get("ROOM_ID", "")
+ROOM_REGION          = os.environ.get("ROOM_REGION", "ME")
+ROOM_JOIN_RETRIES    = int(os.environ.get("ROOM_JOIN_RETRIES", "5"))
+ROOM_JOIN_INTERVAL   = float(os.environ.get("ROOM_JOIN_INTERVAL", "1.5"))
 
 WEBHOOK_URL          = os.environ.get("WEBHOOK_URL", "")
 XORE_DEBUG           = os.environ.get("XORE_DEBUG", "0") == "1"
@@ -357,8 +349,17 @@ _GHOST_STATE = {
 }
 _GHOST_LOCK = threading.Lock()
 
+# ═══ ROOM STATE (جديد v5.2) ═══
+_ROOM_STATE = {
+    "active": False, "room_id": None, "started_at": 0,
+    "accounts": 0, "joined": 0, "failed": 0, "events": [],
+}
+_ROOM_LOCK = threading.Lock()
+_ROOM_STOP_EVENTS = []
+
 _STATS = {
     "ghost_runs": 0, "blitz_runs": 0, "spam_runs": 0, "watch_runs": 0,
+    "room_runs": 0,
     "checks": 0, "logins_ok": 0, "logins_fail": 0,
     "started_at": time.time(),
 }
@@ -370,7 +371,6 @@ _ACTIVITY_LOCK = threading.Lock()
 _HISTORY = []
 _HISTORY_LOCK = threading.Lock()
 
-# Packet ring buffer for /watch-debug
 _PACKET_DUMP = []
 _PACKET_DUMP_LOCK = threading.Lock()
 
@@ -497,6 +497,23 @@ def _ghost_snapshot():
         return dict(_GHOST_STATE)
 
 
+# ═══ ROOM SNAPSHOT / PUSH (جديد v5.2) ═══
+def _room_snapshot():
+    with _ROOM_LOCK:
+        return dict(_ROOM_STATE)
+
+
+def _room_push(kind, uid=None):
+    with _ROOM_LOCK:
+        if kind == "joined": _ROOM_STATE["joined"] += 1
+        elif kind == "failed": _ROOM_STATE["failed"] += 1
+        _ROOM_STATE["events"].insert(0, {
+            "t": time.strftime("%H:%M:%S"), "kind": kind, "uid": uid,
+        })
+        del _ROOM_STATE["events"][80:]
+    _activity(f"room:{kind}", uid=uid)
+
+
 def get_live_status():
     with _LIVE_LOCK:
         return dict(_LIVE_STATUS)
@@ -577,14 +594,7 @@ def Parse_ProToBuF(data):
     return fields
 
 
-# ═══════════════════════════════════════════════════════════
-#  🎯  MEMBER UID EXTRACTOR — v5.1 STRONG
-# ═══════════════════════════════════════════════════════════
-
 def _extract_member_uids(packet):
-    """Extract candidate player UIDs from decoded blackboxprotobuf JSON.
-    Handles: int, str-of-digits, bytes (4/8 byte BE, or ASCII digits),
-    nested lists/dicts, depth up to 12."""
     uids = set()
     if not isinstance(packet, dict):
         return uids
@@ -595,36 +605,29 @@ def _extract_member_uids(packet):
         if isinstance(d, int):
             return d
         if isinstance(d, str) and d.isdigit():
-            try:
-                return int(d)
-            except Exception:
-                return None
+            try: return int(d)
+            except Exception: return None
         if isinstance(d, (bytes, bytearray)):
             try:
                 if len(d) in (4, 8):
                     return int.from_bytes(d, "big")
                 s = d.decode("ascii", errors="ignore")
-                if s.isdigit():
-                    return int(s)
+                if s.isdigit(): return int(s)
             except Exception:
                 return None
         return None
 
     def walk(node, depth=0):
-        if depth > 12:
-            return
+        if depth > 12: return
         if isinstance(node, list):
-            for item in node:
-                walk(item, depth + 1)
+            for item in node: walk(item, depth + 1)
             return
-        if not isinstance(node, dict):
-            return
+        if not isinstance(node, dict): return
         if "data" in node:
             v = _coerce_int(node["data"])
             if v is not None and 100_000 < v < 99_999_999_999:
                 uids.add(v)
-        for v in node.values():
-            walk(v, depth + 1)
+        for v in node.values(): walk(v, depth + 1)
 
     walk(packet)
     return uids
@@ -726,6 +729,38 @@ def Join_Team(team_code, key, iv):
                 {1: 29, 2: 204}, {1: 22, 2: 118}, {1: 14, 2: 139}, {1: 21},
             ],
             27: {1: 2, 2: 4},
+        },
+    }
+    return GeneRaTePk(CrEaTe_ProTo(main).hex(), "0519", key, iv)
+
+
+# ═══ JOIN ROOM (جديد v5.2) ═══
+def Join_Room(room_id, key, iv, region=None):
+    """Join a Custom Room by Room ID."""
+    reg = (region or ROOM_REGION or "ME").upper()
+    sub = {
+        1: bytes.fromhex("01090a0b121619201d2729"), 2: 40,
+        3: bytes.fromhex("01090a0b121619201d2729"), 4: "w\\Z]", 6: 12,
+        7: bytes.fromhex("01090a0b121619201d2729"),
+        8: "1.132.9", 9: 6, 10: 2,
+        11: bytes.fromhex("01090a0b121619201d2729"),
+    }
+    main = {
+        1: 6,  # opcode الانضمام للروم
+        2: {
+            4: bytes.fromhex("01090a0b121619201d2729"),
+            5: str(room_id),
+            6: 6, 8: 1, 9: sub,
+            11: {1: "IDC1", 2: 99, 3: reg},
+            13: "ar",
+            16: bytes.fromhex("374f521955"),
+            20: [
+                {1: 3, 2: 360}, {1: 4, 2: 391}, {1: 5, 2: 156},
+                {1: 29, 2: 204}, {1: 22, 2: 118}, {1: 14, 2: 139}, {1: 21},
+            ],
+            27: {1: 2, 2: 4},
+            30: 1,                 # flag: custom room
+            31: str(room_id),      # fallback field
         },
     }
     return GeneRaTePk(CrEaTe_ProTo(main).hex(), "0519", key, iv)
@@ -1144,9 +1179,6 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
             if _fast_send(s, ghost):
                 result["sent"] += 1
 
-        # ═══════════════════════════════════════════════════
-        #  WATCH MODE — v5.1 FIXED
-        # ═══════════════════════════════════════════════════
         if watch_state is not None and WELCOME_ENABLED:
             result["status"] = "watching"
             watch_deadline = time.time() + WATCH_KEEPALIVE
@@ -1184,7 +1216,6 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                     if not members:
                         continue
 
-                    # baseline window — collect silently
                     if (not watch_state["baseline_done"]
                             and time.time() - watch_state["started"]
                                 < WATCH_BASELINE_WAIT):
@@ -1208,7 +1239,6 @@ def _Session(host, port, uid, jwt, ts, key, iv, mode, tag,
                         if not is_new:
                             continue
 
-                        # try multiple channels
                         sent_ok = False
                         for ch in WELCOME_CHANNELS_TRY:
                             try:
@@ -1304,17 +1334,15 @@ def run_one_account(session_data, team_code, barrier, deadline,
         threads.append(t); t.start()
 
     if watch_state is not None:
-        for t in threads:
-            t.join()
+        for t in threads: t.join()
     else:
         remaining = max(0.5, deadline - time.time())
-        for t in threads:
-            t.join(timeout=remaining)
+        for t in threads: t.join(timeout=remaining)
     return results
 
 
 # ═══════════════════════════════════════════════════════════
-#  💥  SPAM  /  🌍  BLITZ
+#  💥  SPAM  /  🌍  BLITZ  /  🚪 ROOM
 # ═══════════════════════════════════════════════════════════
 
 def _SpamCycle(session_data, team_code, stop_event, rate, duration):
@@ -1455,8 +1483,67 @@ def _BlitzWorker(session_data, team_code, stop_event, linger_s, chat_msg):
             pass
 
 
+# ═══ ROOM WORKER (جديد v5.2) ═══
+def _Join_Room_Worker(session_data, room_id, stop_event, retries, interval):
+    """محاولة انضمام حساب واحد للروم بعدة محاولات."""
+    uid = session_data["uid"]
+    jwt = session_data["jwt"]; ts = session_data["ts"]
+    key = session_data["key"]; iv = session_data["iv"]
+    host = session_data["ip"]; port = session_data["port"]
+
+    s = None
+    tries = 0; ok = False; error_msg = None
+    try:
+        s = socket.create_connection((host, int(port)),
+                                     timeout=TCP_CONNECT_TIMEOUT)
+        s.settimeout(3)
+        _TuneSock(s)
+        s.sendall(bytes.fromhex(
+            BuildAuthToken(uid, jwt, ts, key, iv, mode="online")))
+        time.sleep(POST_LOGIN_WAIT)
+
+        room_pkt = Join_Room(room_id, key, iv)
+        exit_pkt = ExiT(key, iv)
+
+        for i in range(retries):
+            if stop_event.is_set(): break
+            tries += 1
+            try:
+                if _fast_send(s, room_pkt):
+                    ok = True
+                    _activity("room:send", f"uid={uid} try={i+1}")
+            except Exception as e:
+                error_msg = str(e)
+                _activity("room:err", f"uid={uid} {e}")
+            time.sleep(interval)
+
+        # حاول قراءة رد السيرفر للتأكيد
+        s.settimeout(2.0)
+        try:
+            data = s.recv(65536)
+            if data:
+                _dump_packet(uid, "room-rx", data.hex())
+        except Exception:
+            pass
+
+        # خروج نظيف
+        try: s.sendall(exit_pkt)
+        except Exception: pass
+
+    except Exception as e:
+        error_msg = str(e)
+        _activity("room:fail", f"uid={uid} {e}")
+    finally:
+        try:
+            if s: s.close()
+        except Exception:
+            pass
+
+    return {"uid": uid, "ok": ok, "tries": tries, "error": error_msg}
+
+
 # ═══════════════════════════════════════════════════════════
-#  🎨  CSS — v5.1
+#  🎨  CSS
 # ═══════════════════════════════════════════════════════════
 
 BASE_CSS = """
@@ -1556,6 +1643,7 @@ button.warn{background:linear-gradient(135deg,var(--warn),#c2410c);color:#1a1000
 button.gold{background:linear-gradient(135deg,#f5b800,#d97706);color:#1a1000}
 button.gray{background:linear-gradient(135deg,#6f6f88,#3f3f55)}
 button.cyan{background:linear-gradient(135deg,#06b6d4,#0891b2)}
+button.purple{background:linear-gradient(135deg,#8b5cf6,#ec4899)}
 .btn-full{width:100%;padding:18px;font-size:16px;letter-spacing:2px}
 .badge{display:inline-block;padding:4px 11px;border-radius:7px;font-size:10.5px;
  font-weight:800;letter-spacing:.5px;text-transform:uppercase}
@@ -1617,6 +1705,8 @@ footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
 .animate-in{animation:fadeIn .35s ease-out}
 .blitz{border-color:rgba(245,184,0,.5);
  background:linear-gradient(180deg,rgba(245,184,0,.06),transparent)}
+.room{border-color:rgba(139,92,246,.6);
+ background:linear-gradient(180deg,rgba(139,92,246,.08),transparent)}
 .admin-tag{display:inline-block;padding:3px 10px;background:linear-gradient(135deg,#8b5cf6,#ec4899);
  color:#fff;border-radius:6px;font-size:10px;font-weight:900;letter-spacing:1px;margin-left:8px}
 .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
@@ -1636,6 +1726,7 @@ footer .xore{font-size:16px;font-weight:900;letter-spacing:8px;
 .log-line .k.blitz{color:var(--warn)}
 .log-line .k.spam{color:var(--error)}
 .log-line .k.watch{color:var(--success)}
+.log-line .k.room{color:var(--xore-3)}
 .log-line .k.acct{color:var(--xore-2)}
 .log-line .k.check{color:var(--xore-3)}
 .log-line .msg{color:var(--text);opacity:.85;flex:1;overflow:hidden;
@@ -1720,7 +1811,7 @@ def _wrap(title, body):
 {body}
 <footer>
   <div class="xore">XORE</div>
-  <div>Powered by XORE · Free Fire OB55 · ME · v5.1 · DEV EDITION</div>
+  <div>Powered by XORE · Free Fire OB55 · ME · v5.2 · DEV EDITION</div>
 </footer>
 </div>
 <div class="toast-wrap" id="toastWrap"></div>
@@ -1944,7 +2035,7 @@ function renderResult(r) {{
 
 
 # ═══════════════════════════════════════════════════════════
-#  📄  ADMIN PAGE — v5.1
+#  📄  ADMIN PAGE
 # ═══════════════════════════════════════════════════════════
 
 def render_admin(key):
@@ -1953,6 +2044,7 @@ def render_admin(key):
     stats = _stats_snapshot()
     ws = _watch_snapshot(); sp = _spam_snapshot()
     bz = _blitz_snapshot(); gs = _ghost_snapshot()
+    rs = _room_snapshot()
 
     if live["checked"] and not live["checking"]:
         live_html = f"""
@@ -1982,6 +2074,8 @@ def render_admin(key):
         <span class="dot"></span> Spam</span>
       <span class="mod {'on' if ws['active'] else ''}">
         <span class="dot"></span> Watch</span>
+      <span class="mod {'on' if rs['active'] else ''}">
+        <span class="dot"></span> Room</span>
       <span class="mod {'on' if live['checking'] else ''}">
         <span class="dot"></span> Check</span>
     </div>
@@ -1990,7 +2084,7 @@ def render_admin(key):
     body = f"""
 <div class="header">
   <div class="logo">XORE</div>
-  <div class="tagline"><span class="admin-tag">DEV v5.1</span> CONTROL PANEL</div>
+  <div class="tagline"><span class="admin-tag">DEV v5.2</span> CONTROL PANEL</div>
   <div class="status-bar">
     <div class="pill live"><span class="dot"></span> ADMIN</div>
     <div class="pill">إجمالي: <span id="hdrTotal">{count}</span></div>
@@ -2020,6 +2114,8 @@ def render_admin(key):
     <div class="value red" id="s-spam">{stats.get("spam_runs",0)}</div></div>
   <div class="stat"><div class="label">Watch runs</div>
     <div class="value green" id="s-watch">{stats.get("watch_runs",0)}</div></div>
+  <div class="stat"><div class="label">Room runs</div>
+    <div class="value purple" id="s-room">{stats.get("room_runs",0)}</div></div>
   <div class="stat"><div class="label">Uptime</div>
     <div class="value cyan" style="font-size:22px" id="s-uptime">{stats.get("uptime",0)}s</div></div>
 </div>
@@ -2048,6 +2144,31 @@ def render_admin(key):
   <div id="blitzStatus" style="margin-top:16px"></div>
 </div>
 
+<!-- JOIN ROOM (جديد v5.2) -->
+<div class="card room">
+  <h2 style="color:var(--xore-1)">🚪 دخول روم مخصص (Room ID)</h2>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:12px">
+    اكتب <strong>كود الروم</strong> → كل الحسابات تدخل الروم تلقائياً
+    (يختلف عن كود الفريق)
+  </p>
+  <div class="input-row">
+    <input type="text" id="roomId" placeholder="مثال: 1234567890"
+           minlength="1" maxlength="30" autocomplete="off"
+           value="{ROOM_ID}"
+           style="text-align:center;font-size:18px;padding:16px;
+                  letter-spacing:3px;font-weight:800;max-width:400px">
+    <input type="text" id="roomLimit" placeholder="عدد (0=الكل)"
+           value="0" style="max-width:120px">
+    <input type="text" id="roomRetries" placeholder="محاولات"
+           value="{ROOM_JOIN_RETRIES}" style="max-width:120px">
+    <button onclick="startJoinRoom()" id="roomBtn" class="purple" style="flex:1">
+      🚪 دخول الروم
+    </button>
+    <button onclick="stopJoinRoom()" class="gray">⏹ إيقاف</button>
+  </div>
+  <div id="roomStatus" style="margin-top:14px"></div>
+</div>
+
 <!-- GHOST -->
 <div class="card">
   <h2>👻 Ghost (4HB · Speed 6x)</h2>
@@ -2062,7 +2183,7 @@ def render_admin(key):
 
 <!-- WATCH -->
 <div class="card">
-  <h2>👋 Auto-Welcome <span class="admin-tag">v5.1 FIX</span></h2>
+  <h2>👋 Auto-Welcome</h2>
   <p style="color:var(--muted);font-size:13px;margin-bottom:12px">
     الترحيب: <code style="background:#000;padding:2px 8px;border-radius:4px;color:var(--xore-2)">{WELCOME_MSG}</code>
     · قناة أساسية: {WELCOME_CHANNEL} · fallback: {WELCOME_CHANNELS_TRY}
@@ -2077,7 +2198,7 @@ def render_admin(key):
   <div id="watchStatus" style="margin-top:14px"></div>
   <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
     <button onclick="showWatchDebug()" class="sm cyan">🔍 عرض Packets</button>
-    <button onclick="testWelcome()" class="sm purple" style="background:linear-gradient(135deg,var(--xore-1),var(--xore-3))">🧪 اختبار 4 قنوات</button>
+    <button onclick="testWelcome()" class="sm purple">🧪 اختبار 4 قنوات</button>
   </div>
   <div id="watchDebugResult" style="margin-top:14px"></div>
 </div>
@@ -2201,7 +2322,7 @@ def render_admin(key):
   <h2>🕐 سجل الجلسات (آخر 50)</h2>
   <div class="scroll-y">
     <table class="table" id="historyTable">
-      <thead><tr><th>الوقت</th><th>النوع</th><th>الفريق</th><th>حسابات</th></tr></thead>
+      <thead><tr><th>الوقت</th><th>النوع</th><th>الفريق/الروم</th><th>حسابات</th></tr></thead>
       <tbody id="historyBody"><tr><td colspan="4" style="text-align:center;color:var(--muted);padding:16px">لا يوجد سجل</td></tr></tbody>
     </table>
   </div>
@@ -2260,7 +2381,7 @@ function renderPresets() {{
   ).join(' ');
 }}
 function pickTeam(t) {{
-  ['blitzTeam','ghostTeam','watchTeam','spamTeam'].forEach(id => {{
+  ['blitzTeam','ghostTeam','watchTeam','spamTeam','roomId'].forEach(id => {{
     const e = document.getElementById(id);
     if (e) e.value = t;
   }});
@@ -2496,10 +2617,8 @@ function renderAccountRows() {{
         <button class="xs cyan" onclick="copyText('${{esc(it.password)}}')" title="نسخ PW">🔑</button>
         <button class="xs ${{it.enabled?'warn':'green'}}"
                 onclick="toggleAccount('${{esc(it.uid)}}')">${{it.enabled?'⏸':'▶'}}</button>
-        <button class="xs purple" style="background:linear-gradient(135deg,var(--xore-1),var(--xore-3))"
-                onclick="testOne('${{esc(it.uid)}}')">🔍</button>
-        <button class="xs gold" style="background:linear-gradient(135deg,#f5b800,#d97706);color:#1a1000"
-                onclick="editMeta('${{esc(it.uid)}}')">✏️</button>
+        <button class="xs purple" onclick="testOne('${{esc(it.uid)}}')">🔍</button>
+        <button class="xs gold" onclick="editMeta('${{esc(it.uid)}}')">✏️</button>
         <button class="xs danger" onclick="deleteAccount('${{esc(it.uid)}}')">🗑</button>
       </td>
     </tr>`;
@@ -2558,95 +2677,3 @@ async function testOne(uid) {{
 }}
 async function editMeta(uid) {{
   const it = (UI.lastList.items || []).find(x => x.uid === uid);
-  if (!it) return;
-  const alias = prompt('Alias:', it.alias || ''); if (alias === null) return;
-  const note = prompt('ملاحظة:', it.note || ''); if (note === null) return;
-  try {{
-    const r = await fetch('/accounts/meta', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{ key: KEY, uid, alias, note }}),
-    }});
-    const d = await r.json();
-    if (d.ok) {{ toast('تم التحديث', 'success'); reloadList(); }}
-    else toast(d.error || 'فشل', 'error');
-  }} catch (e) {{ toast(e.message, 'error'); }}
-}}
-async function clearAccounts() {{
-  if (!confirm('مسح كل الحسابات؟ لا يمكن التراجع.')) return;
-  if (!confirm('تأكيد أخير — سيتم حذف الكل.')) return;
-  try {{
-    const r = await fetch('/accounts/clear?key=' + KEY);
-    const d = await r.json();
-    if (d.ok) {{
-      toast('حُذف ' + d.removed + ' حساب', 'success');
-      reloadList();
-      document.getElementById('hdrTotal').textContent = '0';
-    }}
-  }} catch (e) {{ toast(e.message, 'error'); }}
-}}
-
-// ═══ GHOST ═══
-async function startGhost() {{
-  const team = document.getElementById('ghostTeam').value.trim();
-  if (!team) return toast('أدخل كود الفريق', 'warn');
-  const btn = document.getElementById('ghostBtn');
-  const out = document.getElementById('ghostResult');
-  btn.disabled = true; btn.innerHTML = '...<span class="spinner"></span>';
-  out.innerHTML = '<div class="result-box"><div class="label">⏳ يشتغل...</div></div>';
-  try {{
-    const r = await fetch('/start?team=' + encodeURIComponent(team) + '&format=json');
-    const d = await r.json();
-    out.innerHTML = `
-      <div class="result-box">
-        <div><div class="label">دخلت</div><div class="big green">${{d.accounts_logged||0}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">نفذت</div><div class="big purple">${{d.accounts_ran||0}}</div></div>
-        <div style="width:1px;height:50px;background:var(--border)"></div>
-        <div><div class="label">مدة</div><div class="big cyan">${{d.elapsed||0}}s</div></div>
-      </div>`;
-    toast('Ghost: ' + (d.accounts_logged||0) + ' حساب', 'success');
-  }} catch(e) {{
-    out.innerHTML = `<div class="result-box"><div class="label" style="color:var(--error)">${{e.message}}</div></div>`;
-    toast(e.message, 'error');
-  }}
-  btn.disabled = false; btn.innerHTML = '👻 بدء Ghost';
-}}
-
-// ═══ BLITZ ═══
-async function startBlitz() {{
-  const team = document.getElementById('blitzTeam').value.trim();
-  const cnt = document.getElementById('blitzCount').value.trim() || '{BLITZ_ACCOUNTS_MAX}';
-  const lng = document.getElementById('blitzLinger').value.trim() || '{BLITZ_LINGER_S}';
-  const msg = document.getElementById('blitzMsg').value.trim() || DEFAULT_WELCOME;
-  if (!team) return toast('أدخل كود الفريق', 'warn');
-  const btn = document.getElementById('blitzBtn');
-  btn.disabled = true; btn.textContent = '...';
-  try {{
-    const url = `/blitz?team=${{encodeURIComponent(team)}}&accounts=${{cnt}}&linger=${{lng}}`
-      + `&msg=${{encodeURIComponent(msg)}}&key=${{KEY}}`;
-    const r = await fetch(url);
-    const d = await r.json();
-    if (!d.ok) toast('خطأ: ' + (d.error || 'فشل'), 'error');
-    else toast('Blitz بدأ على ' + d.accounts + ' حساب', 'success');
-  }} catch(e) {{ toast(e.message, 'error'); }}
-  btn.disabled = false; btn.textContent = '🌍 ابدأ الانفجار';
-  refreshBlitz();
-}}
-async function stopBlitz() {{
-  await fetch('/stop-blitz?key=' + KEY);
-  refreshBlitz();
-  toast('Blitz موقوف', 'warn');
-}}
-async function refreshBlitz() {{
-  if (!UI.autoRefresh) return;
-  try {{
-    const r = await fetch('/blitz-status');
-    const d = await r.json();
-    const el = document.getElementById('blitzStatus');
-    if (!d.active) {{ el.innerHTML = '<div class="result-box"><div class="label">غير نشط</div></div>'; return; }}
-    const pct = d.total ? Math.floor((d.joined / d.total) * 100) : 0;
-    const evs = (d.events || []).slice(0, 12).map(e =>
-      `<tr><td class="mono">${{e.t}}</td><td>${{e.kind}}</td>
-       <td class="mono">${{e.uid || '-'}}</td></tr>`).join('')
-      || '<tr><td colspan="3" style="text-align:center;color:var(--muted)">لا أحداث</
